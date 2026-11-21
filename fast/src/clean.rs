@@ -117,7 +117,7 @@ struct CRec<K: IdKey> {
     cid: K,
     person: K,
     ts: u32,
-    camp: u16,
+    camp: u32,
 }
 
 /// A surviving event routed to its person's part. `pc` = 0 for view/cart;
@@ -303,25 +303,25 @@ fn links_stage2<K: IdKey>(pre: LinkPre<K>, threads: usize) -> GSharded<K> {
 
 struct Lookups {
     products: KeyMap, // product key -> cat idx
-    unknown_cat: u16,
+    unknown_cat: u32,
     campaigns: KeyMap, // campaign key -> idx
     strict_ingest: bool,
 }
 
 impl Lookups {
     #[inline(always)]
-    fn campaign(&self, m: &[u8], f: &[u8]) -> Option<u16> {
-        self.campaigns.get(pack_in(m, f)).map(|v| v as u16)
+    fn campaign(&self, m: &[u8], f: &[u8]) -> Option<u32> {
+        self.campaigns.get(pack_in(m, f)).map(|v| v as u32)
     }
     #[inline(always)]
-    fn category(&self, m: &[u8], f: &[u8]) -> u16 {
-        self.products.get(pack_in(m, f)).map_or(self.unknown_cat, |v| v as u16)
+    fn category(&self, m: &[u8], f: &[u8]) -> u32 {
+        self.products.get(pack_in(m, f)).map_or(self.unknown_cat, |v| v as u32)
     }
 }
 
 struct ParseState<K: IdKey> {
     ev: WcRegions<ERec<K>, 4>,
-    side: Vec<(u32, u16)>,
+    side: Vec<(u32, u32)>,
     cl: WcRegions<CRec<K>, 8>,
     cbuf: Vec<CRec<K>>,
     chash: Vec<u64>,
@@ -386,7 +386,7 @@ fn read_small(dir: &Path) -> Small {
 
     // products / campaigns
     let mut cat_names: Vec<Box<[u8]>> = Vec::new();
-    let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
+    let mut cat_idx: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut products = KeyMap::with_capacity(1 << 16);
     data_lines(&dir.join("products.csv"), |line| {
         if let Some([p, c]) = csv::split::<2>(line) {
@@ -394,7 +394,7 @@ fn read_small(dir: &Path) -> Small {
                 Some(&ci) => ci,
                 None => {
                     cat_names.push(c.into());
-                    let ci = (cat_names.len() - 1) as u16;
+                    let ci = (cat_names.len() - 1) as u32;
                     cat_idx.insert(c.to_vec(), ci);
                     ci
                 }
@@ -402,7 +402,7 @@ fn read_small(dir: &Path) -> Small {
             products.insert(pack(p), ci as Key);
         }
     });
-    let unknown_cat = cat_names.len() as u16;
+    let unknown_cat = cat_names.len() as u32;
     cat_names.push(b"unknown"[..].into());
     let mut camp_ids: Vec<Box<[u8]>> = Vec::new();
     let mut camp_channels: Vec<Box<[u8]>> = Vec::new();
@@ -441,6 +441,13 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let small = small_cell.wait();
     t("small wait");
     let (ws, we, base, lk) = (small.ws, small.we, small.base, &small.lk);
+    // Times are stored as u32 ms since window_start - 7 days (u32::MAX = invalid
+    // marker): a window longer than ~42.7 days does not fit. No wider path
+    // exists, so refuse loudly instead of wrapping silently.
+    if we - base >= u32::MAX as i64 {
+        eprintln!("fatal: window {} ms + 7 days exceeds the u32 ms time range", we - ws);
+        std::process::exit(3);
+    }
     let unknown_cat = lk.unknown_cat;
     // Stage 2 of links runs on its own thread while the workers parse events;
     // click chunks (which need person = link name) come last and wait for it.
@@ -521,7 +528,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                         long_click.store(true, Ordering::Relaxed);
                     }
                     // person resolved below (batched with prefetch); hold the user key for now
-                    st.cbuf.push(CRec { cid: ck, person: uk, ts: (t - base) as u32, camp: ci as u16 });
+                    st.cbuf.push(CRec { cid: ck, person: uk, ts: (t - base) as u32, camp: ci as u32 });
                 });
                 if !ok {
                     bad.store(true, Ordering::Relaxed);
@@ -577,7 +584,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let deduped = par_items(
         threads,
         nb,
-        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u64, u32, ERec<K>)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u16)>::new(), Vec::<u64>::new()),
+        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u32)>::new(), Vec::<(u64, u32, ERec<K>)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u32)>::new(), Vec::<u64>::new()),
         |(table, surv, cand, out, cnt, pside, hs), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
@@ -758,7 +765,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                     let (price, cat) = if r.pc == 0 {
                         (0, 0)
                     } else if small_cat {
-                        (r.pc & 0xFF_FFFF, (r.pc >> 24) as u16)
+                        (r.pc & 0xFF_FFFF, (r.pc >> 24) as u32)
                     } else {
                         pside[r.pc as usize - 1]
                     };
@@ -893,7 +900,7 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 
 /// Ok(None): malformed for dedup purposes (empty event_id). Err: an ID is not representable as K.
 #[inline(always)]
-fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookups, side: &mut Vec<(u32, u16)>) -> Result<Option<ERec<K>>, ()> {
+fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookups, side: &mut Vec<(u32, u32)>) -> Result<Option<ERec<K>>, ()> {
     let [eid, user, ts, ing, typ, prod, price] = f;
     if eid.is_empty() {
         return Ok(None);
@@ -1068,7 +1075,7 @@ pub fn microbench_clicks(dir: &Path) {
             if t < base || t >= we { return; }
             let Some(ci) = lk.campaigns.get(pack_in(m, camp)) else { return };
             let (Some(ck), Some(uk)) = (<u64 as IdKey>::pack(m, cid), <u64 as IdKey>::pack(m, user)) else { return };
-            cl.push(part_of(uk), CRec { cid: ck, person: uk, ts: (t - base) as u32, camp: ci as u16 });
+            cl.push(part_of(uk), CRec { cid: ck, person: uk, ts: (t - base) as u32, camp: ci as u32 });
         });
         cl.finish();
         (0..NPART).map(|p| cl.len_of(p) as u64).sum()
