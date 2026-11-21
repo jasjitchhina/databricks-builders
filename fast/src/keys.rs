@@ -93,19 +93,21 @@ static DECODE: [u8; 64] = decode_table();
 unsafe fn pack_simd(p: *const u8, n: usize) -> Option<u64> {
     use std::arch::x86_64::*;
     let b = _mm_loadu_si128(p as *const __m128i);
-    let ge = |x: __m128i, lo: u8| _mm_cmpeq_epi8(_mm_max_epu8(x, _mm_set1_epi8(lo as i8)), x); // x >= lo
-    let le = |x: __m128i, hi: u8| _mm_cmpeq_epi8(_mm_min_epu8(x, _mm_set1_epi8(hi as i8)), x); // x <= hi
-    let dig = _mm_and_si128(ge(b, b'0'), le(b, b'9'));
-    let up = _mm_and_si128(ge(b, b'A'), le(b, b'Z'));
-    let lo = _mm_and_si128(ge(b, b'a'), le(b, b'z'));
+    // nibble classification: valid iff CLASS_LO[lo] & CLASS_HI[hi] != 0
+    //   bit0: hi 3, lo 0-9 (digits)   bit1: hi 4/6, lo 1-15 (A-O, a-o)
+    //   bit2: hi 5/7, lo 0-10 (P-Z, p-z)   bit3: hi 5, lo 15 ('_')
+    let lo_n = _mm_and_si128(b, _mm_set1_epi8(0x0F));
+    let hi_n = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(0x0F));
+    let class_lo = _mm_setr_epi8(5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 2, 2, 2, 2, 10);
+    let class_hi = _mm_setr_epi8(0, 0, 0, 1, 2, 12, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0);
+    let cls = _mm_and_si128(_mm_shuffle_epi8(class_lo, lo_n), _mm_shuffle_epi8(class_hi, hi_n));
+    let invalid = _mm_cmpeq_epi8(cls, _mm_setzero_si128());
+    // code = b - OFF[hi] (digits 47, upper 54, lower 59), '_' (95) -> 37
+    let off_hi = _mm_setr_epi8(0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0);
     let us = _mm_cmpeq_epi8(b, _mm_set1_epi8(b'_' as i8));
-    // code = b - off, off = 47 (digit), 54 (upper), 59 (lower); '_' -> 37
-    let off = _mm_or_si128(
-        _mm_or_si128(_mm_and_si128(dig, _mm_set1_epi8(47)), _mm_and_si128(up, _mm_set1_epi8(54))),
-        _mm_and_si128(lo, _mm_set1_epi8(59)),
-    );
-    let code = _mm_or_si128(_mm_and_si128(_mm_sub_epi8(b, off), _mm_or_si128(_mm_or_si128(dig, up), lo)), _mm_and_si128(us, _mm_set1_epi8(37)));
-    let valid = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(dig, up), _mm_or_si128(lo, us))) as u32;
+    let off = _mm_add_epi8(_mm_shuffle_epi8(off_hi, hi_n), _mm_and_si128(us, _mm_set1_epi8(4)));
+    let code = _mm_sub_epi8(b, off);
+    let valid = !(_mm_movemask_epi8(invalid) as u32);
     let need = (1u32 << n) - 1;
     if valid & need != need {
         return None;
