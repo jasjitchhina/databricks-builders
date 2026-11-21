@@ -319,8 +319,41 @@ impl<K: IdKey> GSharded<K> {
     }
     #[inline(always)]
     fn slot(&self, k: K) -> (*const (K, K), usize) {
-        let h = k.hash();
+        self.slot_h(k.hash())
+    }
+    #[inline(always)]
+    fn slot_h(&self, h: u64) -> (*const (K, K), usize) {
         (unsafe { self.slots.as_ptr().add(((h >> 56) as usize) << self.shard_bits) }, h as usize & self.mask)
+    }
+    /// `get` with the key's hash precomputed (h == k.hash()).
+    #[inline(always)]
+    pub fn get_h(&self, k: K, h: u64) -> Option<K> {
+        if !self.maybe_h(h) {
+            return None;
+        }
+        let (base, mut i) = self.slot_h(h);
+        loop {
+            let e = unsafe { &*base.add(i) };
+            if e.0.is_zero() {
+                return None;
+            }
+            if e.0 == k {
+                return Some(e.1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    pub fn prefetch_filter_h(&self, h: u64) {
+        let (w, _) = self.fbits(h);
+        prefetch(unsafe { self.filter.as_ptr().add(w) } as *const u8);
+    }
+    #[inline(always)]
+    pub fn prefetch_if_h(&self, h: u64) {
+        if self.maybe_h(h) {
+            let (base, i) = self.slot_h(h);
+            prefetch(unsafe { base.add(i) } as *const u8);
+        }
     }
     #[inline(always)]
     pub fn get(&self, k: K) -> Option<K> {
@@ -361,8 +394,12 @@ impl<K: IdKey> GSharded<K> {
 
 #[inline(always)]
 pub fn part_of<K: IdKey>(name: K) -> usize {
-    // independent of the shard bits (top 8) and slot bits (low): use bits 40..48
-    ((name.hash() >> 40) & 0xFF) as usize
+    part_of_h(name.hash())
+}
+/// `part_of` from the name's hash (independent of the shard bits (top 8) and slot bits (low)).
+#[inline(always)]
+pub fn part_of_h(h: u64) -> usize {
+    ((h >> 40) & 0xFF) as usize
 }
 
 #[cfg(test)]

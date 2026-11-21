@@ -3,8 +3,8 @@
 use crate::alloc::WcRegions;
 use crate::csv::{self, pack_in, Chunk};
 use crate::ids::{key_cmp, pack, Key, KeyMap, NPART};
-use crate::keys::{part_of, GMap, GSharded, IdKey};
-use crate::model::{Cl, Cleaned, Ev, Part};
+use crate::keys::{part_of, part_of_h, GMap, GSharded, IdKey};
+use crate::model::{Cl, Cleaned, Ev, Part, Rows};
 use crate::ts::{parse_ts, parse_ts_in, DAY_MS};
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -299,6 +299,42 @@ struct Lookups {
     products: KeyMap, // product key -> cat idx
     unknown_cat: u16,
     campaigns: KeyMap, // campaign key -> idx
+    /// Same maps on compact keys, when every catalog ID is compact. Exact: a
+    /// field that is not compact cannot equal any (compact) catalog ID.
+    prod64: Option<GMap<u64, u16>>,
+    camp64: Option<GMap<u64, u16>>,
+}
+
+impl Lookups {
+    #[inline(always)]
+    fn campaign(&self, m: &[u8], f: &[u8]) -> Option<u16> {
+        match &self.camp64 {
+            Some(c) => <u64 as IdKey>::pack(m, f).and_then(|k| if k == 0 { None } else { c.get(k) }),
+            None => self.campaigns.get(pack_in(m, f)).map(|v| v as u16),
+        }
+    }
+    #[inline(always)]
+    fn category(&self, m: &[u8], f: &[u8]) -> u16 {
+        let c = match &self.prod64 {
+            Some(p) => <u64 as IdKey>::pack(m, f).and_then(|k| if k == 0 { None } else { p.get(k) }),
+            None => self.products.get(pack_in(m, f)).map(|v| v as u16),
+        };
+        c.unwrap_or(self.unknown_cat)
+    }
+}
+
+fn compact_map(ids: impl Iterator<Item = (Box<[u8]>, u16)>) -> Option<GMap<u64, u16>> {
+    let mut m: GMap<u64, u16> = GMap::with_capacity(1024);
+    for (id, v) in ids {
+        let k = <u64 as IdKey>::pack(&id, &id)?;
+        if k == 0 {
+            return None; // empty catalog ID: keep the general path
+        }
+        if m.get_or_insert(k, v).is_some() {
+            return None; // duplicate: keep first-wins semantics of the general path
+        }
+    }
+    Some(m)
 }
 
 struct ParseState<K: IdKey> {
@@ -306,6 +342,7 @@ struct ParseState<K: IdKey> {
     side: Vec<(u32, u16)>,
     cl: WcRegions<CRec<K>, 8>,
     cbuf: Vec<CRec<K>>,
+    chash: Vec<u64>,
 }
 
 #[inline(always)]
@@ -358,6 +395,7 @@ fn read_small(dir: &Path) -> Small {
     let mut cat_names: Vec<Box<[u8]>> = Vec::new();
     let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
     let mut prod_rows: Vec<(Key, u16)> = Vec::new();
+    let mut prod_rows_raw: Vec<(Box<[u8]>, u16)> = Vec::new();
     data_lines(&dir.join("products.csv"), |line| {
         if let Some([p, c]) = csv::split::<2>(line) {
             let ci = *cat_idx.entry(c.to_vec()).or_insert_with(|| {
@@ -365,6 +403,7 @@ fn read_small(dir: &Path) -> Small {
                 (cat_names.len() - 1) as u16
             });
             prod_rows.push((pack(p), ci));
+            prod_rows_raw.push((p.into(), ci));
         }
     });
     let unknown_cat = cat_names.len() as u16;
@@ -385,7 +424,11 @@ fn read_small(dir: &Path) -> Small {
     for (i, c) in camp_ids.iter().enumerate() {
         campaigns.insert(pack(c), i as Key);
     }
-    let lk = Lookups { products, unknown_cat, campaigns };
+    let prod_bytes: Vec<(Box<[u8]>, u16)> = prod_rows_raw.iter().map(|(p, c)| (p.clone(), *c)).collect();
+    // Compact catalog maps measured no faster than the u128 ones (A/B, HT-like); kept off.
+    let _ = (prod_bytes, compact_map as fn(std::vec::IntoIter<(Box<[u8]>, u16)>) -> Option<GMap<u64, u16>>);
+    let (prod64, camp64) = (None, None);
+    let lk = Lookups { products, unknown_cat, campaigns, prod64, camp64 };
     Small { ws, we, base, lk, cat_names, camp_ids, camp_channels }
 }
 
@@ -432,6 +475,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
             side: Vec::with_capacity(ev_cap * NB / 20),
             cl: WcRegions::new_with(NPART, cl_cap, huge),
             cbuf: Vec::new(),
+            chash: Vec::new(),
         },
         |st, i| {
             if bad.load(Ordering::Relaxed) {
@@ -464,7 +508,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                     if t < cl_lo || t >= we {
                         return;
                     }
-                    let Some(ci) = lk.campaigns.get(pack_in(m, camp)) else { return };
+                    let Some(ci) = lk.campaign(m, camp) else { return };
                     let (Some(ck), Some(uk)) = (K::pack(m, cid), K::pack(m, user)) else {
                         ok = false;
                         return;
@@ -479,16 +523,25 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                     bad.store(true, Ordering::Relaxed);
                 }
                 let n = st.cbuf.len();
+                st.chash.clear();
+                st.chash.extend(st.cbuf.iter().map(|r| r.person.hash()));
                 for j in 0..n {
                     if j + 2 * PF < n {
-                        links.prefetch_filter(st.cbuf[j + 2 * PF].person);
+                        links.prefetch_filter_h(unsafe { *st.chash.get_unchecked(j + 2 * PF) });
                     }
                     if j + PF < n {
-                        links.prefetch_if(st.cbuf[j + PF].person);
+                        links.prefetch_if_h(unsafe { *st.chash.get_unchecked(j + PF) });
                     }
-                    let mut r = st.cbuf[j];
-                    r.person = person_of(&links, r.person);
-                    st.cl.push(part_of(r.person), r);
+                    let mut r = unsafe { *st.cbuf.get_unchecked(j) };
+                    let h = unsafe { *st.chash.get_unchecked(j) };
+                    let ph = match links.get_h(r.person, h) {
+                        Some(nm) => {
+                            r.person = nm;
+                            nm.hash()
+                        }
+                        None => h,
+                    };
+                    st.cl.push(part_of_h(ph), r);
                 }
             }
         },
@@ -518,7 +571,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     let deduped = par_items(
         threads,
         NB,
-        |_| (Vec::<u64>::new(), Vec::<(K, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec<K>, 8>::new_with(NPART, out_cap, huge)),
+        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec<K>, 8>::new_with(NPART, out_cap, huge)),
         |(table, surv, losers, out), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
@@ -576,7 +629,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                         return;
                     }
                     let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
-                    surv.push((r.user, r.ts, price, cat));
+                    surv.push((r.user, r.user.hash(), r.ts, price, cat));
                 });
             }
             let _q2 = Instant::now();
@@ -584,14 +637,17 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
             let _qd = Defer(|| { let q3 = Instant::now(); DD_NS[0].fetch_add((_q1 - _q0).as_nanos() as usize, Ordering::Relaxed); DD_NS[1].fetch_add((_q2 - _q1).as_nanos() as usize, Ordering::Relaxed); DD_NS[2].fetch_add((q3 - _q2).as_nanos() as usize, Ordering::Relaxed); });
             for j in 0..n {
                 if j + 2 * PF < n {
-                    links.prefetch_filter(surv[j + 2 * PF].0);
+                    links.prefetch_filter_h(unsafe { surv.get_unchecked(j + 2 * PF) }.1);
                 }
                 if j + PF < n {
-                    links.prefetch_if(surv[j + PF].0);
+                    links.prefetch_if_h(unsafe { surv.get_unchecked(j + PF) }.1);
                 }
-                let (user, ts, price, cat) = surv[j];
-                let person = person_of(&links, user);
-                out.push(part_of(person), PRec { person, ts, price, cat });
+                let (user, h, ts, price, cat) = unsafe { *surv.get_unchecked(j) };
+                let (person, ph) = match links.get_h(user, h) {
+                    Some(nm) => (nm, nm.hash()),
+                    None => (user, h),
+                };
+                out.push(part_of_h(ph), PRec { person, ts, price, cat });
             }
         },
     );
@@ -603,15 +659,28 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     t("dedup");
 
     // per part: dense person ids, clicks
+    let recycle = std::env::var_os("FAST_NO_RECYCLE").is_none();
     let deduped = &deduped;
     let mut parts_out: Vec<Mutex<Option<Part>>> = (0..NPART).map(|_| Mutex::new(None)).collect();
     {
         let parts_ref = &parts_out;
-        par_items(threads, NPART, |_| (), |_, p| {
+        par_items(threads, NPART, |t| {
+            // recycle this thread's dead event-bucket buffer (dedup is done with it)
+            let (b, l) = states[t.min(states.len() - 1)].ev.raw();
+            unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }
+        }, |bump, p| {
             let n: usize = deduped.iter().map(|(_, _, _, o)| o.len_of(p)).sum();
             let mut local: GMap<K, u32> = GMap::with_capacity(1024);
             let mut names: Vec<K> = Vec::new();
-            let mut ev: Vec<Ev> = Vec::with_capacity(n);
+            let mut ev_vec: Vec<Ev> = Vec::new();
+            let ev_ptr: *mut Ev = match bump.take::<Ev>(n) {
+                Some(q) => q,
+                None => {
+                    ev_vec.reserve_exact(n);
+                    ev_vec.as_mut_ptr()
+                }
+            };
+            let mut ne = 0usize;
             for (_, _, _, o) in deduped.iter() {
                 o.each(p, |_, r| {
                     let id = match local.get_or_insert(r.person, names.len() as u32) {
@@ -621,17 +690,41 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                             (names.len() - 1) as u32
                         }
                     };
-                    ev.push(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat });
+                    unsafe { ev_ptr.add(ne).write(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat }) };
+                    ne += 1;
                 });
             }
-            let mut cl: Vec<Cl> = Vec::new();
+            let ev = if ev_vec.capacity() > 0 || n == 0 {
+                unsafe { ev_vec.set_len(ne) };
+                Rows::Owned(ev_vec)
+            } else {
+                Rows::Static(unsafe { std::slice::from_raw_parts_mut(ev_ptr, ne) })
+            };
+            let ncl_max: usize = states.iter().map(|s| s.cl.len_of(p)).sum();
+            let mut cl_vec: Vec<Cl> = Vec::new();
+            let cl_ptr: *mut Cl = match bump.take::<Cl>(ncl_max) {
+                Some(q) => q,
+                None => {
+                    cl_vec.reserve_exact(ncl_max);
+                    cl_vec.as_mut_ptr()
+                }
+            };
+            let mut nc = 0usize;
             for s in states.iter() {
                 s.cl.each(p, |_, r| {
                     if let Some(v) = local.get(r.person) {
-                        cl.push(Cl { click_id: r.cid.click(), person: v, ts: r.ts, camp: r.camp });
+                        unsafe { cl_ptr.add(nc).write(Cl { click_id: r.cid.click(), person: v, ts: r.ts, camp: r.camp }) };
+                        nc += 1;
                     }
                 });
             }
+            let cl = if cl_vec.capacity() > 0 || ncl_max == 0 {
+                unsafe { cl_vec.set_len(nc) };
+                Rows::Owned(cl_vec)
+            } else {
+                bump.shrink_last(cl_ptr, nc);
+                Rows::Static(unsafe { std::slice::from_raw_parts_mut(cl_ptr, nc) })
+            };
             let person_names = names.into_iter().map(|k| k.bytes()).collect();
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
         });
@@ -727,7 +820,7 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
             b"view" | b"cart" => 0,
             b"purchase" => {
                 let Some(p) = parse_price(price) else { break 'v };
-                let cat = lk.products.get(pack_in(m, prod)).map_or(lk.unknown_cat, |c| c as u16);
+                let cat = lk.category(m, prod);
                 side.push((p, cat));
                 side.len() as u32
             }
@@ -757,7 +850,7 @@ pub fn microbench(dir: &Path) {
             products.insert(pack(p), 1);
         }
     });
-    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16) };
+    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16), prod64: None, camp64: None };
     let mut data: Vec<u8> = Vec::new();
     for f in csv::list_csv(&dir.join("events")) {
         let b = std::fs::read(f).unwrap();
@@ -795,6 +888,31 @@ pub fn microbench(dir: &Path) {
         csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64));
         x
     });
+    run("scan+ts_in", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64 ^ parse_ts_in(m, f[3]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+ing", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[3]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+tsonly", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+ts+pk", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64 ^ parse_ts_in(m, f[3]).unwrap_or(0) as u64 ^ <u64 as IdKey>::pack(m, f[0]).unwrap_or(0) ^ <u64 as IdKey>::pack(m, f[1]).unwrap_or(0)));
+        x
+    });
+    run("scan+typ", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x += match f[4] { b"view" | b"cart" => 1, b"purchase" => 2, _ => 3 });
+        x
+    });
     fn noout<K: IdKey>(m: &[u8], n: usize, ws: i64, we: i64, base: i64, lk: &Lookups) -> u64 {
         let mut side = Vec::new();
         let mut x = 0u64;
@@ -813,4 +931,48 @@ pub fn microbench(dir: &Path) {
     }
     run("wc-u64", &mut || wc::<u64>(m, n, ws, we, base, &lk, cap, true));
     run("wc-u128", &mut || wc::<u128>(m, n, ws, we, base, &lk, cap, true));
+}
+
+/// Click-path microbenchmark (no person lookup), dev only.
+pub fn microbench_clicks(dir: &Path) {
+    let small = read_small(dir);
+    let mut data: Vec<u8> = Vec::new();
+    for f in csv::list_csv(&dir.join("clicks")) {
+        let b = std::fs::read(f).unwrap();
+        if let Some(h) = memchr::memchr(b'\n', &b) {
+            data.extend_from_slice(&b[h + 1..]);
+        }
+    }
+    data.extend_from_slice(&[0u8; 64]);
+    let n = data.len() - 64;
+    let lines = memchr::memchr_iter(b'\n', &data[..n]).count();
+    let run = |name: &str, f: &mut dyn FnMut() -> u64| {
+        let mut best = f64::MAX;
+        let mut chk = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            chk = f();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{:<12} {:>7.1} ns/line  (chk {})", name, best * 1e9 / lines as f64, chk);
+    };
+    let m = &data[..];
+    let (we, base, lk) = (small.we, small.base, &small.lk);
+    run("scan4", &mut || { let mut x = 0u64; csv::scan_fast::<4, _>(m, 0, n, |f| x += f[3].len() as u64); x });
+    run("+ts", &mut || { let mut x = 0u64; csv::scan_fast::<4, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[3]).unwrap_or(0) as u64)); x });
+    run("+camp", &mut || { let mut x = 0u64; csv::scan_fast::<4, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[3]).unwrap_or(0) as u64 + lk.campaigns.get(pack_in(m, f[2])).unwrap_or(0) as u64)); x });
+    run("+packs", &mut || { let mut x = 0u64; csv::scan_fast::<4, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[3]).unwrap_or(0) as u64 + lk.campaigns.get(pack_in(m, f[2])).unwrap_or(0) as u64 + <u64 as IdKey>::pack(m, f[0]).unwrap_or(0) + <u64 as IdKey>::pack(m, f[1]).unwrap_or(0))); x });
+    run("full-nolink", &mut || {
+        let mut cl = WcRegions::<CRec<u64>, 8>::new_with(NPART, lines / NPART * 2, true);
+        csv::scan_fast::<4, _>(m, 0, n, |[cid, user, camp, ts]| {
+            if cid.is_empty() || user.is_empty() { return; }
+            let Some(t) = parse_ts_in(m, ts) else { return };
+            if t < base || t >= we { return; }
+            let Some(ci) = lk.campaigns.get(pack_in(m, camp)) else { return };
+            let (Some(ck), Some(uk)) = (<u64 as IdKey>::pack(m, cid), <u64 as IdKey>::pack(m, user)) else { return };
+            cl.push(part_of(uk), CRec { cid: ck, person: uk, ts: (t - base) as u32, camp: ci as u16 });
+        });
+        cl.finish();
+        (0..NPART).map(|p| cl.len_of(p) as u64).sum()
+    });
 }
