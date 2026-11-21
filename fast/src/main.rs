@@ -161,7 +161,7 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
             ZAP_KEEP[2 * t + 1].store(tls_addr(), SeqCst);
             ZAP_READY.fetch_add(1, SeqCst);
             while !ZAP_GO.load(SeqCst) {
-                std::hint::spin_loop();
+                unsafe { libc::sched_yield() };
             }
             loop {
                 let i = ZAP_NEXT.fetch_add(1, SeqCst);
@@ -178,7 +178,7 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
         });
     }
     while ZAP_READY.load(SeqCst) < nt {
-        std::hint::spin_loop();
+        unsafe { libc::sched_yield() };
     }
     let probe = 0u8;
     let mut keep: Vec<usize> = ZAP_KEEP[..2 * nt].iter().map(|a| a.load(SeqCst)).collect();
@@ -223,7 +223,7 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     ZAP_GO.store(true, SeqCst);
     // from here on: no allocation, no destructors, no stdio
     while ZAP_DONE.load(SeqCst) < nt {
-        std::hint::spin_loop();
+        unsafe { libc::sched_yield() };
     }
     unsafe { libc::_exit(0) }
 }

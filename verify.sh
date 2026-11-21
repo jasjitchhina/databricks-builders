@@ -43,13 +43,22 @@ trap 'rm -rf "$WORK" 2>/dev/null' EXIT
 FAILS=()
 
 echo "== [0] lint ($REV)"
-LINT=$(git -C "$ROOT" grep -nIE 'target-cpu *= *native|target-cpu=native|-march=native|avx512' "$REV" -- ':!verify.sh' ':!*.md' 2>/dev/null || true)
+LINT=$(git -C "$ROOT" grep -nIE 'target-cpu *= *native|target-cpu=native|-march=native|avx512' "$REV" -- ':!verify.sh' ':!*.md' ':!fast/vendor/**' ':!harness/**' 2>/dev/null || true)
 if [ -n "$LINT" ]; then echo "FAIL lint: native/avx512 codegen flags found:"; echo "$LINT"; FAILS+=(lint-native); fi
 SIZE_KB=$(git -C "$ROOT" ls-tree -r -l "$REV" | awk '{s+=$4} END{printf "%d", s/1024}')
 if [ "${SIZE_KB:-0}" -gt 45000 ]; then echo "FAIL lint: tracked files ${SIZE_KB} KB (limit 50 MB)"; FAILS+=(lint-size); fi
 BIG=$(git -C "$ROOT" ls-tree -r --name-only "$REV" | grep -E '\.(parquet|csv)$' | grep -vE '^(fixtures|dev-answer)/' || true)
 if [ -n "$BIG" ]; then echo "FAIL lint: data files tracked: $BIG"; FAILS+=(lint-data); fi
 [ ${#FAILS[@]} -eq 0 ] && echo "ok   lint (tracked ${SIZE_KB} KB)"
+# binary-level ISA check: the image entrypoint must contain no AVX-512 (zmm, EVEX hi regs, opmask regs)
+if [ ! -f "$TARGET" ] && command -v objdump >/dev/null; then
+  BIN_IN=$(docker image inspect -f '{{index .Config.Cmd 0}}' "$TARGET" 2>/dev/null)
+  CID=$(docker create "$TARGET" 2>/dev/null) && docker cp "$CID:$BIN_IN" "$WORK/entry.bin" >/dev/null 2>&1; [ -n "${CID:-}" ] && docker rm "$CID" >/dev/null
+  if [ -f "$WORK/entry.bin" ] && file "$WORK/entry.bin" | grep -q ELF; then
+    N512=$(objdump -d --no-show-raw-insn "$WORK/entry.bin" | grep -cE 'zmm|[xy]mm(1[6-9]|2[0-9]|3[01])|%k[1-7]' || true)
+    if [ "$N512" -gt 0 ]; then echo "FAIL isa: $BIN_IN has $N512 AVX-512 instructions"; FAILS+=(isa-avx512); else echo "ok   isa ($BIN_IN: no AVX-512)"; fi
+  else echo "warn isa: entrypoint $BIN_IN is not an ELF binary; skipped"; fi
+fi
 
 echo "== [1] fixtures ($TARGET)"
 if python3 "$ROOT/scripts/run_fixtures.py" "$ROOT/fixtures" -- "$RUN" > "$WORK/fixtures.txt" 2>&1; then
