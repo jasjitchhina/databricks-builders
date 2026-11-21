@@ -184,12 +184,12 @@ struct Flat {
     ev_person: Vec<u32>,
     ev_ts: Vec<u32>,
     ev_price: Vec<u32>,
-    ev_cat: Vec<u16>,
+    ev_cat: Vec<u32>,
     cat_names: Vec<Box<[u8]>>,
-    unknown: u16,
+    unknown: u32,
     cl_person: Vec<u32>,
     cl_ts: Vec<u32>,
-    cl_camp: Vec<u16>,
+    cl_camp: Vec<u32>,
     cl_id: Vec<Box<[u8]>>,
     camp_ids: Vec<Box<[u8]>>,
     camp_channels: Vec<Box<[u8]>>,
@@ -232,20 +232,20 @@ fn load_flat(data: &Path) -> Flat {
     let mut c = Flat { base_ms: base, ws_ms: ws, we_ms: we, ..Default::default() };
 
     // products
-    let mut cat_idx: FxHashMap<Vec<u8>, u16> = FxHashMap::default();
-    let mut prod: FxHashMap<Vec<u8>, u16> = FxHashMap::default();
+    let mut cat_idx: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
+    let mut prod: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
     for_lines(&[data.join("products.csv")], |l| {
         let mut fields = Vec::with_capacity(8);
         if split_fields(l, 2, &mut fields) {
             if let (Some(p), Some(cat)) = (fields[0], fields[1]) {
-                let n = cat_idx.len() as u16;
+                let n = cat_idx.len() as u32;
                 let ci = *cat_idx.entry(cat.to_vec()).or_insert(n);
                 prod.insert(p.to_vec(), ci);
             }
         }
     });
     let unknown = {
-        let n = cat_idx.len() as u16;
+        let n = cat_idx.len() as u32;
         *cat_idx.entry(b"unknown".to_vec()).or_insert(n)
     };
     let mut cats = vec![Box::<[u8]>::default(); cat_idx.len()];
@@ -256,12 +256,12 @@ fn load_flat(data: &Path) -> Flat {
     c.unknown = unknown;
 
     // campaigns
-    let mut camp: FxHashMap<Vec<u8>, u16> = FxHashMap::default();
+    let mut camp: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
     for_lines(&[data.join("campaigns.csv")], |l| {
         let mut fields = Vec::with_capacity(8);
         if split_fields(l, 2, &mut fields) {
             if let (Some(id), Some(ch)) = (fields[0], fields[1]) {
-                camp.insert(id.to_vec(), c.camp_ids.len() as u16);
+                camp.insert(id.to_vec(), c.camp_ids.len() as u32);
                 c.camp_ids.push(id.into());
                 c.camp_channels.push(ch.into());
             }

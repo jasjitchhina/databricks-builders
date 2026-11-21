@@ -10,7 +10,7 @@ pub struct Cleaned {
     pub we_ms: i64,
     /// category index -> name; includes `unknown` (index `unknown_cat`).
     pub cat_names: Vec<Box<[u8]>>,
-    pub unknown_cat: u16,
+    pub unknown_cat: u32,
     /// campaigns.csv order; `organic` is NOT included.
     pub camp_ids: Vec<Box<[u8]>>,
     pub camp_channels: Vec<Box<[u8]>>,
@@ -124,7 +124,7 @@ pub struct Ev {
     /// price in cents for a purchase (always >= 1); 0 for view/cart.
     pub price: u32,
     /// category index; only meaningful for purchases (0 otherwise).
-    pub cat: u16,
+    pub cat: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,5 +134,9 @@ pub struct Cl {
     pub click_id: u128,
     pub person: u32,
     pub ts: u32,
-    pub camp: u16,
+    pub camp: u32,
 }
+
+// The u32 category / campaign indices must not grow the hot row types.
+const _: () = assert!(std::mem::size_of::<Ev>() == 16);
+const _: () = assert!(std::mem::size_of::<Cl>() == 32);

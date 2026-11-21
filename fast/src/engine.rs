@@ -45,9 +45,9 @@ struct Scratch {
     /// per person: (asst row offset, first global session index) of each day with sessions
     days: Vec<(u32, u32)>,
     catsum: Vec<u64>,
-    cat_touched: Vec<u16>,
+    cat_touched: Vec<u32>,
     sess_cat: Vec<u64>,
-    sess_touched: Vec<u16>,
+    sess_touched: Vec<u32>,
     /// day-major [di * (ncamp+1) + k], compact (16B) so the hot table stays in L2
     camp: Vec<CampAcc16>,
     /// day-major [di * (ncamp+1) + k], compact so one session's assists hit one 8KB row
@@ -68,7 +68,7 @@ struct Scratch {
 pub trait EvT: Copy {
     fn ts(&self) -> u32;
     fn price(&self) -> u32;
-    fn cat(&self) -> u16;
+    fn cat(&self) -> u32;
 }
 impl EvT for Ev {
     #[inline(always)]
@@ -80,7 +80,7 @@ impl EvT for Ev {
         self.price
     }
     #[inline(always)]
-    fn cat(&self) -> u16 {
+    fn cat(&self) -> u32 {
         self.cat
     }
 }
@@ -97,13 +97,13 @@ impl EvT for PEv {
         ((self.0 >> 9) & 0xFF_FFFF) as u32
     }
     #[inline(always)]
-    fn cat(&self) -> u16 {
-        (self.0 & 511) as u16
+    fn cat(&self) -> u32 {
+        (self.0 & 511) as u32
     }
 }
 pub trait ClT: Copy {
     fn ts(&self) -> u32;
-    fn camp(&self) -> u16;
+    fn camp(&self) -> u32;
     fn cid(&self, part: &Part) -> u128;
 }
 impl ClT for Cl {
@@ -112,7 +112,7 @@ impl ClT for Cl {
         self.ts
     }
     #[inline(always)]
-    fn camp(&self) -> u16 {
+    fn camp(&self) -> u32 {
         self.camp
     }
     #[inline(always)]
@@ -129,8 +129,8 @@ impl ClT for PCl {
         (self.0 >> 33) as u32
     }
     #[inline(always)]
-    fn camp(&self) -> u16 {
-        ((self.0 >> 21) & 4095) as u16
+    fn camp(&self) -> u32 {
+        ((self.0 >> 21) & 4095) as u32
     }
     #[inline(always)]
     fn cid(&self, part: &Part) -> u128 {
@@ -227,12 +227,12 @@ pub struct Ctx {
     pub base_ms: i64,
     pub ncamp: usize,
     pub ncat: usize,
-    pub organic: u16,
+    pub organic: u32,
     base_day: i64,
     base_rem: u64,
     pub day0: i32,
     pub ndays: usize,
-    rank: Vec<u16>,
+    rank: Vec<u32>,
     packable: bool,
     pub dump: bool,
     pub cat_names: Vec<Box<[u8]>>,
@@ -249,11 +249,11 @@ impl Ctx {
         let day0 = ws_ms.div_euclid(DAY_MS) as i32;
         let ndays = ((we_ms - 1).div_euclid(DAY_MS) as i32 - day0 + 1).max(1) as usize;
         // category rank by name (for byte-wise smallest tie-break)
-        let mut order: Vec<u16> = (0..ncat as u16).collect();
+        let mut order: Vec<u32> = (0..ncat as u32).collect();
         order.sort_by(|&a, &b| cat_names[a as usize].cmp(&cat_names[b as usize]));
-        let mut rank = vec![0u16; ncat];
+        let mut rank = vec![0u32; ncat];
         for (r, &k) in order.iter().enumerate() {
-            rank[k as usize] = r as u16;
+            rank[k as usize] = r as u32;
         }
         // packed u64 fast path limits (else generic structs)
         let max_ts = (we_ms - base_ms).max(0) as u64;
@@ -266,7 +266,7 @@ impl Ctx {
             base_ms,
             ncamp,
             ncat,
-            organic: ncamp as u16,
+            organic: ncamp as u32,
             base_day,
             base_rem,
             day0,
@@ -283,8 +283,8 @@ impl Ctx {
         (self.base_day + ((self.base_rem + rel as u64) / DAY_MS as u64) as i64) as i32
     }
     #[inline]
-    fn pick_top(&self, sums: &[u64], touched: &[u16]) -> Option<u16> {
-        let mut best: Option<u16> = None;
+    fn pick_top(&self, sums: &[u64], touched: &[u32]) -> Option<u32> {
+        let mut best: Option<u32> = None;
         for &k in touched {
             best = match best {
                 None => Some(k),
@@ -592,8 +592,7 @@ fn process_person<E: EvT, C: ClT>(
         debug_assert!(((day - day0) as usize) < ctx.ndays);
 
         // attribution window [start - 7d, start]
-        let v7 = VARIANT.load(Relaxed) == 7;
-        while !v7 && hi < pc.len() && pc[hi].ts() <= start {
+        while hi < pc.len() && pc[hi].ts() <= start {
             let k = pc[hi].camp() as usize;
             unsafe {
                 let c = cnt.get_unchecked_mut(k);
@@ -622,7 +621,7 @@ fn process_person<E: EvT, C: ClT>(
             let t = pc[hi - 1].ts();
             let mut best = hi - 1;
             let mut q = hi - 1;
-            while VARIANT.load(Relaxed) != 6 && q > lo && pc[q - 1].ts() == t {
+            while q > lo && pc[q - 1].ts() == t {
                 q -= 1;
                 if pc[q].cid(part) < pc[best].cid(part) {
                     best = q;
@@ -694,7 +693,7 @@ fn flush_day(
     events: u32,
     revenue: u64,
     catsum: &mut [u64],
-    cat_touched: &mut Vec<u16>,
+    cat_touched: &mut Vec<u32>,
     u: &mut [pq::ColBuf],
     urows: &mut usize,
     ctx: &Ctx,
