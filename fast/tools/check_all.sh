@@ -14,5 +14,5 @@ for s in ${SETS:-dev s2-1m s3-1m s4-1m s5-1m s15-1m-feb29 s62-1m-feb29}; do
   python3 $HERE/tools/cmp_oracle.py ~/data/$s ~/data/oracle/$s/dump $W/$s >$W/$s.log 2>&1 && echo "ok $s" || { echo "FAIL $s"; cat $W/$s.log; fail=1; }
 done
 rm -rf $W
-[ $fail = 0 ] && echo ALL OK
+[ $fail = 0 ] && echo ALL OK || echo SOME FAILED
 exit $fail

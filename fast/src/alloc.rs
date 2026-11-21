@@ -211,7 +211,7 @@ impl<T: Copy> Regions<T> {
         let cap = cap.max(1);
         let sz = std::mem::size_of::<T>();
         assert!(std::mem::align_of::<T>() <= 64);
-        let stride = (cap * sz + 4095) & !4095;
+        let stride = (cap * sz + 64 * 64 + 4095) & !4095; // room for the max skew
         let bytes = nreg * stride + 64 * 64 + 4096;
         let (hb, mut vb) = if huge { (Some(HugeBuf::<u8>::zeroed(bytes)), Vec::new()) } else { (None, Vec::<u8>::with_capacity(bytes)) };
         let p0 = match &hb { Some(h) => h.as_mut_ptr(), None => vb.as_mut_ptr() };
@@ -307,7 +307,7 @@ impl<T: Copy, const K: usize> WcRegions<T, K> {
         let sz = std::mem::size_of::<T>();
         assert!((K * sz) % 64 == 0 && std::mem::align_of::<T>() <= 64);
         let cap = (cap.max(K) + K - 1) / K * K;
-        let stride = (cap * sz + 4095) & !4095;
+        let stride = (cap * sz + 64 * 64 + 4095) & !4095; // room for the max skew
         let bytes = nreg * stride + 64 * 64 + 4096;
         let mut vb = Vec::<u8>::with_capacity(bytes);
         let p0 = ((vb.as_mut_ptr() as usize + 4095) & !4095) as *mut u8;
@@ -419,4 +419,49 @@ unsafe fn nt_copy(dst: *mut u8, src: *const u8, n: usize) {
     }
     #[cfg(not(target_feature = "avx2"))]
     std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
+/// Orders this thread's non-temporal stores before anything that follows
+/// (must run on the thread that issued them, before the data is shared).
+#[inline(always)]
+pub fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wc_regions_full_and_spill() {
+        for &(nreg, cap) in &[(256usize, 85usize), (70, 64), (3, 1), (65, 4096 / 48 * 4)] {
+            let mut w = WcRegions::<[u64; 6], 4>::new(nreg, cap);
+            let mut r2 = Regions::<[u64; 6]>::new_with(nreg, cap, false);
+            let per = cap + 13;
+            for i in 0..per {
+                for r in 0..nreg {
+                    let x = [r as u64, i as u64, 7, 7, 7, 7];
+                    w.push(r, x);
+                    r2.push(r, x);
+                }
+            }
+            w.finish();
+            for r in 0..nreg {
+                assert_eq!(w.len_of(r), per);
+                assert_eq!(r2.len_of(r), per);
+                let mut n = 0;
+                w.each(r, |i, x| {
+                    assert_eq!(*x, [r as u64, i as u64, 7, 7, 7, 7]);
+                    assert_eq!(w.at(r, i), x);
+                    n += 1;
+                });
+                assert_eq!(n, per);
+                for (i, x) in r2.iter(r).enumerate() {
+                    assert_eq!(*x, [r as u64, i as u64, 7, 7, 7, 7]);
+                }
+            }
+        }
+    }
 }

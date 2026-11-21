@@ -342,6 +342,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         |st, i| {
             let c = chunks[i];
             let m: &[u8] = maps[c.file].as_ref().unwrap();
+            let _fence = Defer(crate::alloc::sfence);
             let _t0 = Instant::now();
             let _g = Defer(|| { let ns = _t0.elapsed().as_nanos() as usize; if c.file < n_ev_files { EV_NS.fetch_add(ns, Ordering::Relaxed); } else { CL_NS.fetch_add(ns, Ordering::Relaxed); } });
             if c.file < n_ev_files {
@@ -397,6 +398,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         NB,
         |_| (Vec::<u64>::new(), Vec::<(Key, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec, 4>::new(NPART, out_cap)),
         |(table, surv, losers, out), b| {
+            let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
             if n == 0 {
                 return;
