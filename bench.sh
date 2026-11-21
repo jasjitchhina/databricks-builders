@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # bench.sh: the ONLY sanctioned way to time the pipeline.
 #
-#   ./bench.sh [-n RUNS] [-i IMAGE | -r GITREV] [--no-build] [DATASET ...]
+#   ./bench.sh [-n RUNS] [-i IMAGE | -r GITREV] [--no-build] [--cold] [DATASET ...]
+#
+# --cold evicts the dataset's files from the page cache before every run (harness/evict.py,
+# posix_fadvise DONTNEED, no root) to model a scorer whose /data is not yet cached.
 #
 # -r GITREV builds that commit/branch (e.g. wt/h4, main) from a clean `git archive` export instead of
 # this worktree, so any helper's committed state can be benched without touching their worktree.
@@ -17,6 +20,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 DATA_ROOT=${DATA_ROOT:-$HOME/data}
 RUNS=3
+COLD=0
 REV=""
 IMAGE=""
 BUILD=1
@@ -27,6 +31,7 @@ while [ $# -gt 0 ]; do
     -i) IMAGE=$2; BUILD=0; shift 2 ;;
     -r) REV=$2; shift 2 ;;
     --no-build) BUILD=0; shift ;;
+    --cold) COLD=1; shift ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) DATASETS+=("$1"); shift ;;
   esac
@@ -52,7 +57,7 @@ if [ -z "$IMAGE" ]; then
 fi
 if [ "$BUILD" = 1 ]; then
   echo "== building $IMAGE from $CTX ($COMMIT)" >&2
-  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$IMAGE" "$CTX" >&2
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$IMAGE" "$CTX" >&2
 fi
 [ -n "$REV" ] && rm -rf "$CTX"
 
@@ -86,11 +91,13 @@ median() { sort -g | awk '{a[NR]=$1} END{ if(NR%2) print a[(NR+1)/2]; else print
 for DS in "${DATASETS[@]}"; do
   DATA=$(resolve "$DS")
   NAME=$(basename "$DATA")
+  TAG=$NAME; [ "$COLD" = 1 ] && TAG="$NAME(cold)"
   TIMES=(); PEAKS=(); CHECK="no-oracle"
   for ((r=1; r<=RUNS; r++)); do
     rm -rf "$WORK" 2>/dev/null || cleanup
     mkdir -p "$WORK/out" "$WORK/scratch"; chmod 777 "$WORK/out" "$WORK/scratch"
     sync
+    [ "$COLD" = 1 ] && python3 "$ROOT/harness/evict.py" "$DATA"
     T0=$(date +%s.%N)
     CID=$(docker create --platform linux/amd64 \
       --cpuset-cpus 0-7 --cpus 8 --memory 24g --memory-swap 24g \
@@ -138,6 +145,6 @@ print('%.3f'%(p('$F')-p('$S')))")
   MED=$(printf '%s\n' "${TIMES[@]}" | median)
   MAXP=$(printf '%s\n' "${PEAKS[@]}" | sort -g | tail -1)
   ALL=$(IFS=,; echo "${TIMES[*]}")
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$BRANCH" "$COMMIT" "$IMAGE" "$NAME" "$RUNS" "$MED" "$ALL" "$MAXP" "$CHECK" >> "$RESULTS"
-  echo "RESULT $NAME commit=$COMMIT median=${MED}s runs=[$ALL] peak_rss=${MAXP}GB check=$CHECK"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$BRANCH" "$COMMIT" "$IMAGE" "$TAG" "$RUNS" "$MED" "$ALL" "$MAXP" "$CHECK" >> "$RESULTS"
+  echo "RESULT $TAG commit=$COMMIT median=${MED}s runs=[$ALL] peak_rss=${MAXP}GB check=$CHECK"
 done

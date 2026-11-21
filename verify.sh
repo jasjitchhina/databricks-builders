@@ -27,12 +27,12 @@ if [ "$TARGET" = "-r" ]; then
   git -C "$ROOT" archive "$COMMIT" | tar -x -C "$CTX"
   TARGET="verify-rev-$COMMIT:latest"
   echo "== building $TARGET from $REV ($COMMIT)" >&2
-  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
   rm -rf "$CTX"
 elif [ -z "$TARGET" ]; then
   TARGET="verify-$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.\n-' '-'):latest"
   echo "== building $TARGET" >&2
-  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
 elif [ -f "$TARGET" ]; then
   TARGET=$(cd "$(dirname "$TARGET")" && pwd)/$(basename "$TARGET")
 fi
