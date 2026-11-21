@@ -9,6 +9,10 @@ fn main() {
     fast::set_threads(threads);
     let c = fast::clean::clean(std::path::Path::new(&a[1]), threads);
     let nv: u64 = std::env::var("VARIANTS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let prof = std::env::var("FAST_PROF").ok();
+    if prof.is_some() {
+        fast::prof::start(100);
+    }
     let mut v = vec![vec![]; nv as usize];
     for _ in 0..n {
         for var in 0..nv {
@@ -31,6 +35,9 @@ fn main() {
         let mut sizes: Vec<(usize, usize, usize)> = c.parts.iter().map(|p| (p.ev.len(), p.cl.len(), p.person_names.len())).collect();
         sizes.sort();
         eprintln!("parts ev/cl/persons: min {:?} med {:?} max {:?}", sizes[0], sizes[sizes.len()/2], sizes[sizes.len()-1]);
+    }
+    if let Some(p) = &prof {
+        fast::prof::stop(p);
     }
     eprintln!("first run {:.1} ms", v[0][0]);
     for (i, v) in v.iter_mut().enumerate() {
