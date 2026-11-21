@@ -19,10 +19,19 @@ WS = int(ws.timestamp() * 1000)
 WE = int(we.timestamp() * 1000)
 DAY, MIN = 86_400_000, 60_000
 
+STRUCT = R.random() < 0.5  # structural/odd-ID mode
 users = [f"u{i}" for i in range(R.randint(2, 12))] + ["U1", " u1", "u1 ", "x"]
 prods = [f"p{i}" for i in range(6)]
 cats = ["a", "b", "c", "unknown_x"]
 camps = [f"c_{i}" for i in range(5)]
+LONG = "abcdefghijklmnopqrstuvwxyz0123456789"
+if STRUCT:
+    # IDs around and beyond 15/16 bytes (u128 key packing edge), shared long prefixes, multibyte UTF-8
+    users += ["u" + LONG[:k] for k in (13, 14, 15, 16, 17, 30)] + ["u" + LONG[:14] + "a", "u" + LONG[:14] + "b",
+              "ü1", "日本", "u\t1", "\U0001F600", "u" + LONG + LONG]
+    prods += ["p" + LONG[:20], "p" + LONG[:15], "製品"]
+    cats += ["カテゴリ", "a" + LONG]
+    camps += ["c_" + LONG[:14], "c_" + LONG[:20], "c_" + LONG[:21]]
 
 
 def iso(ms, form=None):
@@ -76,22 +85,34 @@ def line(fields, exact=False):
     return s
 
 
-def write(path, header, rows):
+def write(path, header, rows, trailing=True):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="") as f:
-        f.write(header + "\n" + "".join(r + "\n" for r in rows))
+    body = header + "\n" + "".join(r + "\n" for r in rows)
+    if not trailing and rows:
+        body = body[:-1]  # last line without its \n (rules: only \n ENDS a line; EOF also ends it)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write(body)
 
 
 def split(name, header, rows):
-    k = R.randint(1, 3)
+    k = R.randint(1, 3) if not STRUCT else R.choice([1, 2, 5, 40])
     R.shuffle(rows)
     parts = [[] for _ in range(k)]
     for r in rows:
         parts[R.randrange(k)].append(r)
     for i, p in enumerate(parts):
-        write(os.path.join(out, name, f"part-{i:05d}.csv"), header, p)
+        write(os.path.join(out, name, f"part-{i:05d}.csv"), header, p,
+              trailing=not (STRUCT and R.random() < 0.5))
     if R.random() < 0.3:
         write(os.path.join(out, name, "part-99999.csv"), header, [])
+    if STRUCT and R.random() < 0.5:
+        write(os.path.join(out, name, "part-99998.csv"), header, [], trailing=False)  # header w/o newline
+    if STRUCT and R.random() < 0.3:
+        os.makedirs(os.path.join(out, name), exist_ok=True)
+        open(os.path.join(out, name, "part-99997.csv"), "wb").close()  # 0-byte file
+    if STRUCT and R.random() < 0.3:
+        with open(os.path.join(out, name, "README.txt"), "w") as f:  # not *.csv: must be ignored
+            f.write(header + "\nzzz,zzz\n")
 
 
 # events: clustered times so gaps near 30 min are common
@@ -109,7 +130,9 @@ for _ in range(R.randint(20, 250)):
     price = R.choice(["100", "0250", "10000000", "10000001", "0", "", "19.99", "-5", "+5", "２５０", "1", "500"])
     pid = R.choice(prods + ["p9", "P1", "", " p1"])
     tsv = iso(t) if R.random() > 0.08 else bad_ts(t)
-    fields = [f"e{eid}", u, tsv, iso(ing, "F1") if ing % 1000 == 0 else iso(ing - ing % 1000, "F1"), typ, pid, price]
+    # STRUCT: long event ids sharing a long prefix, so dedup must compare the full bytes
+    eid_s = (("E" + LONG[:R.choice([14, 15, 16, 30])]) if STRUCT and R.random() < 0.5 else "e") + str(eid)
+    fields = [eid_s, u, tsv, iso(ing, "F1") if ing % 1000 == 0 else iso(ing - ing % 1000, "F1"), typ, pid, price]
     if R.random() < 0.04:
         fields[6] += "\r"  # \r baked into the value, so identical copies carry it too
     ev.append(line(fields, exact=True))
@@ -141,6 +164,10 @@ for i in range(R.randint(0, 80)):
         cl.append(line(fields, exact=True))
     if R.random() < 0.1:  # same-ms tie with another click id
         cl.append(line([f"j{i}", u, R.choice(camps), fields[3]]))
+    if STRUCT and R.random() < 0.2:  # same-ms tie between long click ids sharing a 15+ byte prefix
+        pre = "K" + LONG[:R.choice([13, 14, 15, 16, 20])]
+        for suf in R.sample(["", "a", "b", "0", "~", "A"], 3):
+            cl.append(line([pre + suf + str(i), u, R.choice(camps), fields[3]]))
 split("clicks", "click_id,user_id,campaign_id,ts", cl)
 
 lk = []
