@@ -484,7 +484,10 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let nb = 1usize << nb_bits;
     let nbm = (nb - 1) as u64;
     let ev_cap = ev_est * 5 / 4 / nb / threads + 64;
-    let cl_cap = cl_bytes / 45 * 5 / 4 / NPART / threads + 64;
+    // clicks/PRec per person partition are skewed (a few huge persons): uniform 25% headroom
+    // is mostly unused (zeroed THP pages) while the hot partitions spill anyway; size at the
+    // mean (overflow goes to the per-region spill Vec, as before). Measured task 53.
+    let cl_cap = cl_bytes / 45 / NPART / threads + 64;
     let long_click = AtomicBool::new(false);
     let huge = std::env::var_os("FAST_NO_THP").is_none();
     t("map+chunk");
@@ -595,7 +598,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
 
     // dedup by event_id, per bucket
     let states = &states;
-    let out_cap = ev_est * 5 / 4 / NPART / threads + 64;
+    let out_cap = ev_est / NPART / threads + 64; // mean, see cl_cap
     // categories incl. unknown fit 8 bits => price and category pack into one u32
     let small_cat = small.cat_names.len() <= 256 && std::env::var_os("FAST_SIDE_CAT").is_none();
     let deduped = par_items(
