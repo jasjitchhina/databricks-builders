@@ -149,15 +149,20 @@ impl KeyMap {
         }
     }
     #[inline(always)]
+    pub fn prefetch(&self, k: Key) {
+        let i = hk(k) as usize & self.mask;
+        prefetch(unsafe { self.slots.as_ptr().add(i) } as *const u8);
+    }
+    #[inline(always)]
     pub fn get(&self, k: Key) -> Option<Key> {
         let mut i = hk(k) as usize & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
-            if s.0 == k {
-                return Some(s.1);
-            }
             if s.0 == 0 {
                 return None;
+            }
+            if s.0 == k {
+                return Some(s.1);
             }
             i = (i + 1) & self.mask;
         }
@@ -182,5 +187,33 @@ mod tests {
         assert_eq!(key_cmp(l1, l2), Ordering::Less);
         assert_eq!(key_cmp(pack(b"1"), l1), Ordering::Greater);
         assert_eq!(l1, pack(b"0123456789012345"));
+    }
+}
+
+#[inline(always)]
+pub fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
+/// KeyMap sharded by the top 8 bits of the hash, so shards can be built in parallel.
+pub struct ShardedMap {
+    pub shards: Vec<KeyMap>,
+}
+
+impl ShardedMap {
+    #[inline(always)]
+    pub fn shard_of(k: Key) -> usize {
+        (hk(k) >> 56) as usize
+    }
+    #[inline(always)]
+    pub fn get(&self, k: Key) -> Option<Key> {
+        unsafe { self.shards.get_unchecked(Self::shard_of(k)) }.get(k)
+    }
+    #[inline(always)]
+    pub fn prefetch(&self, k: Key) {
+        unsafe { self.shards.get_unchecked(Self::shard_of(k)) }.prefetch(k)
     }
 }
