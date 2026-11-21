@@ -11,9 +11,6 @@ use crate::ids::{self, prefetch};
 
 pub trait IdKey: Copy + Eq + Send + Sync + Default + 'static {
     const WIDE: bool;
-    /// Padding that makes the clean stage's event record a multiple of 64
-    /// bytes (zero-sized for compact keys).
-    type Pad: Copy + Default + Send + Sync + 'static;
     /// Packs field `f` of mapping `m` (may over-read `m`). None: not representable.
     fn pack(m: &[u8], f: &[u8]) -> Option<Self>;
     fn hash(self) -> u64;
@@ -35,7 +32,6 @@ pub trait IdKey: Copy + Eq + Send + Sync + Default + 'static {
 
 impl IdKey for u128 {
     const WIDE: bool = true;
-    type Pad = [u8; 16];
     #[inline(always)]
     fn pack(m: &[u8], f: &[u8]) -> Option<Self> {
         Some(crate::csv::pack_in(m, f))
@@ -151,7 +147,6 @@ fn pack_scalar(f: &[u8]) -> Option<u64> {
 
 impl IdKey for u64 {
     const WIDE: bool = false;
-    type Pad = ();
     #[inline(always)]
     fn pack(m: &[u8], f: &[u8]) -> Option<Self> {
         let n = f.len();
