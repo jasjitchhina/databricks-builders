@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 rayon = "1"
 rustc-hash = "2"
-parquet = { version = "60", default-features = false }
+parquet = { version = "60", default-features = false, features = ["snap", "zstd"] }
 
 [profile.release]
 opt-level = 3

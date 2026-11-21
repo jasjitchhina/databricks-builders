@@ -132,7 +132,7 @@ pub fn write(out_dir: &Path, c: &Cleaned, o: &Output) {
             let mut top = Vec::with_capacity(n);
             let mut def = Vec::with_capacity(n);
             for row in rows.iter() {
-                uid.push(ba(&c.person_names[row.person as usize]));
+                uid.push(ba(&c.parts[row.part as usize].person_names[row.person as usize]));
                 day.push(row.day);
                 s.push(row.sessions as i64);
                 e.push(row.events as i64);

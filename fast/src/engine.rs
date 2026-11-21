@@ -2,25 +2,9 @@
 //! aggregate into user_daily / campaign_daily rows.
 use crate::model::*;
 use rayon::prelude::*;
-use std::cell::UnsafeCell;
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Ev {
-    ts: u32,
-    price: u32,
-    cat: u16,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Cl {
-    ts: u32,
-    idx: u32,
-    camp: u16,
-}
 
 pub struct UserRow {
+    pub part: u32,
     pub person: u32,
     pub day: i32,
     pub sessions: u32,
@@ -46,69 +30,6 @@ pub struct Output {
     pub session_dump: Option<Vec<Vec<u8>>>,
 }
 
-struct SyncPtr<T>(UnsafeCell<*mut T>);
-unsafe impl<T> Sync for SyncPtr<T> {}
-impl<T> SyncPtr<T> {
-    fn new(p: *mut T) -> Self {
-        SyncPtr(UnsafeCell::new(p))
-    }
-    #[inline]
-    fn get(&self) -> *mut T {
-        unsafe { *self.0.get() }
-    }
-    #[inline]
-    unsafe fn write(&self, i: usize, v: T) {
-        (*self.0.get()).add(i).write(v)
-    }
-}
-
-/// Counting sort of `n` items by `key(i)` in [0, nkeys). Returns (offsets[nkeys+1], items).
-fn group_by<T: Copy + Send + Sync>(
-    n: usize,
-    nkeys: usize,
-    key: impl Fn(usize) -> u32 + Sync,
-    item: impl Fn(usize) -> T + Sync,
-) -> (Vec<u32>, Vec<T>) {
-    let nt = rayon::current_num_threads().max(1);
-    let nchunks = if n < 1 << 16 { 1 } else { nt };
-    let chunk = n.div_ceil(nchunks).max(1);
-    let ranges: Vec<(usize, usize)> = (0..nchunks).map(|c| (c * chunk, ((c + 1) * chunk).min(n))).collect();
-    let mut hists: Vec<Vec<u32>> = ranges
-        .par_iter()
-        .map(|&(a, b)| {
-            let mut h = vec![0u32; nkeys];
-            for i in a..b {
-                h[key(i) as usize] += 1;
-            }
-            h
-        })
-        .collect();
-    // offsets: key-major, chunk-minor
-    let mut offs = vec![0u32; nkeys + 1];
-    let mut acc = 0u32;
-    for k in 0..nkeys {
-        offs[k] = acc;
-        for h in hists.iter_mut() {
-            let c = h[k];
-            h[k] = acc;
-            acc += c;
-        }
-    }
-    offs[nkeys] = acc;
-    let mut out: Vec<T> = Vec::with_capacity(n);
-    let p = SyncPtr::new(out.as_mut_ptr());
-    ranges.par_iter().zip(hists.par_iter_mut()).for_each(|(&(a, b), h)| {
-        for i in a..b {
-            let k = key(i) as usize;
-            let pos = h[k];
-            h[k] = pos + 1;
-            unsafe { p.write(pos as usize, item(i)) };
-        }
-    });
-    unsafe { out.set_len(n) };
-    (offs, out)
-}
-
 struct Scratch {
     cnt: Vec<u32>,
     active: Vec<u16>,
@@ -120,10 +41,39 @@ struct Scratch {
     camp: Vec<CampAcc>,
     rows: Vec<UserRow>,
     dump: Vec<u8>,
+    cur_person: u32,
+    eoff: Vec<u32>,
+    coff: Vec<u32>,
+    evs: Vec<Ev>,
+    cls: Vec<Cl>,
+}
+
+/// counting sort of items by person into `out`, offsets into `off` (len np+1)
+fn group<T: Copy>(items: &[T], np: usize, key: impl Fn(&T) -> u32, off: &mut Vec<u32>, out: &mut Vec<T>) {
+    off.clear();
+    off.resize(np + 1, 0);
+    for it in items {
+        off[key(it) as usize + 1] += 1;
+    }
+    for i in 0..np {
+        off[i + 1] += off[i];
+    }
+    out.clear();
+    out.reserve(items.len());
+    // scatter using a cursor copy
+    let mut cur: Vec<u32> = off[..np].to_vec();
+    unsafe {
+        let o = out.as_mut_ptr();
+        for it in items {
+            let k = key(it) as usize;
+            o.add(cur[k] as usize).write(*it);
+            cur[k] += 1;
+        }
+        out.set_len(items.len());
+    }
 }
 
 pub fn run(c: &Cleaned, dump: bool) -> Output {
-    let np = c.person_names.len();
     let ncamp = c.camp_ids.len();
     let ncat = c.cat_names.len();
     let organic = ncamp as u16;
@@ -157,39 +107,6 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
         best
     };
 
-    let (eoff, mut evs) = group_by(
-        c.ev_ts.len(),
-        np,
-        |i| c.ev_person[i],
-        |i| Ev { ts: c.ev_ts[i], price: c.ev_price[i], cat: c.ev_cat[i] },
-    );
-    let (coff, mut cls) = group_by(
-        c.cl_ts.len(),
-        np,
-        |i| c.cl_person[i],
-        |i| Cl { ts: c.cl_ts[i], idx: i as u32, camp: c.cl_camp[i] },
-    );
-
-    // person chunks balanced by event count
-    let total = evs.len() + cls.len();
-    let target = (total / 512).max(4096);
-    let mut chunks: Vec<(usize, usize)> = vec![];
-    let mut a = 0usize;
-    let mut acc = 0usize;
-    for p in 0..np {
-        acc += (eoff[p + 1] - eoff[p]) as usize + (coff[p + 1] - coff[p]) as usize + 1;
-        if acc >= target {
-            chunks.push((a, p + 1));
-            a = p + 1;
-            acc = 0;
-        }
-    }
-    if a < np {
-        chunks.push((a, np));
-    }
-
-    let evs_p = SyncPtr::new(evs.as_mut_ptr());
-    let cls_p = SyncPtr::new(cls.as_mut_ptr());
     let new_scratch = || Scratch {
         cnt: vec![0; ncamp],
         active: vec![],
@@ -201,37 +118,56 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
         camp: vec![CampAcc::default(); (ncamp + 1) * ndays],
         rows: vec![],
         dump: vec![],
+        cur_person: 0,
+        eoff: vec![],
+        coff: vec![],
+        evs: vec![],
+        cls: vec![],
     };
 
-    let results: Vec<(Vec<UserRow>, Vec<CampAcc>, Vec<u8>)> = chunks
+    // process largest parts first for load balance
+    let mut order: Vec<usize> = (0..c.parts.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(c.parts[i].ev.len() + c.parts[i].cl.len()));
+
+    let results: Vec<(Vec<Vec<UserRow>>, Vec<CampAcc>, Vec<u8>)> = order
         .par_iter()
         .fold(
             || (vec![], None::<Scratch>),
-            |(mut out, mut sc), &(pa, pb)| {
+            |(mut out, mut sc), &pi| {
                 let s = sc.get_or_insert_with(new_scratch);
-                for p in pa..pb {
+                let part = &c.parts[pi];
+                let np = part.person_names.len();
+                group(&part.ev, np, |e| e.person, &mut s.eoff, &mut s.evs);
+                group(&part.cl, np, |e| e.person, &mut s.coff, &mut s.cls);
+                let mut evs = std::mem::take(&mut s.evs);
+                let mut cls = std::mem::take(&mut s.cls);
+                let eoff = std::mem::take(&mut s.eoff);
+                let coff = std::mem::take(&mut s.coff);
+                for p in 0..np {
                     let (ea, eb) = (eoff[p] as usize, eoff[p + 1] as usize);
                     if ea == eb {
                         continue;
                     }
-                    // SAFETY: person ranges are disjoint across tasks.
-                    let pe = unsafe { std::slice::from_raw_parts_mut(evs_p.get().add(ea), eb - ea) };
+                    let pe = &mut evs[ea..eb];
                     let (ca, cb) = (coff[p] as usize, coff[p + 1] as usize);
-                    let pc = unsafe { std::slice::from_raw_parts_mut(cls_p.get().add(ca), cb - ca) };
+                    let pc = &mut cls[ca..cb];
                     pe.sort_unstable_by_key(|e| e.ts);
-                    pc.sort_unstable_by(|x, y| {
-                        x.ts.cmp(&y.ts).then_with(|| c.cl_id[x.idx as usize].cmp(&c.cl_id[y.idx as usize]))
-                    });
-                    process_person(p as u32, pe, pc, s, organic, ndays, day0, &day_of, &pick_top, dump, c);
+                    pc.sort_unstable_by_key(|x| (x.ts, x.click_id));
+                    s.cur_person = p as u32;
+                    process_person(&part.person_names[p], pe, pc, s, organic, ndays, day0, &day_of, &pick_top, dump, c);
                 }
-                out.push(std::mem::take(&mut s.rows));
+                s.evs = evs;
+                s.cls = cls;
+                s.eoff = eoff;
+                s.coff = coff;
+                // tag rows with part so writer can find names
+                out.push(std::mem::take(&mut s.rows).into_iter().map(|mut r| { r.part = pi as u32; r }).collect());
                 (out, sc)
             },
         )
         .map(|(rows, sc)| {
             let mut sc = sc.unwrap_or_else(new_scratch);
-            let flat: Vec<UserRow> = rows.into_iter().flatten().collect();
-            (flat, std::mem::take(&mut sc.camp), std::mem::take(&mut sc.dump))
+            (rows, std::mem::take(&mut sc.camp), std::mem::take(&mut sc.dump))
         })
         .collect();
 
@@ -245,7 +181,7 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
             x.revenue += y.revenue;
             x.assisted += y.assisted;
         }
-        user_rows.push(rows);
+        user_rows.extend(rows);
         dumps.push(d);
     }
     Output { day0, ndays, user_rows, camp, session_dump: if dump { Some(dumps) } else { None } }
@@ -254,7 +190,7 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn process_person(
-    p: u32,
+    name: &[u8],
     pe: &[Ev],
     pc: &[Cl],
     s: &mut Scratch,
@@ -281,7 +217,7 @@ fn process_person(
         // user-day aggregation: flush previous day before accumulating this session
         if day != cur_day {
             if cur_day != i32::MIN {
-                flush_day(p, cur_day, d_sess, d_ev, d_rev, s, pick_top);
+                flush_day(cur_day, d_sess, d_ev, d_rev, s, pick_top);
             }
             cur_day = day;
             d_sess = 0;
@@ -371,7 +307,7 @@ fn process_person(
             let mut assists: Vec<&[u8]> = s.active.iter().map(|&k| &*c.camp_ids[k as usize]).collect();
             assists.sort();
             let d = &mut s.dump;
-            d.extend_from_slice(&c.person_names[p as usize]);
+            d.extend_from_slice(name);
             d.extend_from_slice(format!(",{},{},{},", c.base_ms + start as i64, n, rev).as_bytes());
             if let Some(t) = top {
                 d.extend_from_slice(&c.cat_names[t as usize]);
@@ -392,7 +328,7 @@ fn process_person(
         d_rev += rev;
     }
     if cur_day != i32::MIN {
-        flush_day(p, cur_day, d_sess, d_ev, d_rev, s, pick_top);
+        flush_day(cur_day, d_sess, d_ev, d_rev, s, pick_top);
     }
     // reset attribution window
     for &k in &s.active {
@@ -403,7 +339,6 @@ fn process_person(
 
 #[inline]
 fn flush_day(
-    p: u32,
     day: i32,
     sessions: u32,
     events: u32,
@@ -416,5 +351,5 @@ fn flush_day(
         s.catsum[k as usize] = 0;
     }
     s.cat_touched.clear();
-    s.rows.push(UserRow { person: p, day, sessions, events, revenue, top_cat: top });
+    s.rows.push(UserRow { part: 0, person: s.cur_person, day, sessions, events, revenue, top_cat: top });
 }

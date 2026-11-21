@@ -30,7 +30,7 @@ fn main() {
     if verbose {
         eprintln!(
             "load {:?} engine {:?} write {:?} | events {} clicks {} persons {}",
-            t1 - t0, t2 - t1, t3 - t2, c.ev_ts.len(), c.cl_ts.len(), c.person_names.len()
+            t1 - t0, t2 - t1, t3 - t2, c.parts.iter().map(|p| p.ev.len()).sum::<usize>(), c.parts.iter().map(|p| p.cl.len()).sum::<usize>(), c.parts.iter().map(|p| p.person_names.len()).sum::<usize>()
         );
     }
 }

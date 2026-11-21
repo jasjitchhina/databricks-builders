@@ -173,10 +173,59 @@ impl Uf {
     }
 }
 
+#[derive(Default)]
+struct Flat {
+    base_ms: i64,
+    ws_ms: i64,
+    we_ms: i64,
+    person_names: Vec<Box<[u8]>>,
+    ev_person: Vec<u32>,
+    ev_ts: Vec<u32>,
+    ev_price: Vec<u32>,
+    ev_cat: Vec<u16>,
+    cat_names: Vec<Box<[u8]>>,
+    cl_person: Vec<u32>,
+    cl_ts: Vec<u32>,
+    cl_camp: Vec<u16>,
+    cl_id: Vec<Box<[u8]>>,
+    camp_ids: Vec<Box<[u8]>>,
+    camp_channels: Vec<Box<[u8]>>,
+}
+
 pub fn load(data: &Path) -> Cleaned {
+    let c = load_flat(data);
+    // rank-preserving click_id packing (temp loader: rank over all ids)
+    let mut ids: Vec<&[u8]> = c.cl_id.iter().map(|b| &**b).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let rank = |b: &[u8]| ids.binary_search(&b).unwrap() as u128;
+    let mut parts: Vec<Part> = (0..NPART).map(|_| Part::default()).collect();
+    for (g, name) in c.person_names.iter().enumerate() {
+        parts[g % NPART].person_names.push(name.clone());
+    }
+    for i in 0..c.ev_ts.len() {
+        let g = c.ev_person[i] as usize;
+        parts[g % NPART].ev.push(Ev { person: (g / NPART) as u32, ts: c.ev_ts[i], price: c.ev_price[i], cat: c.ev_cat[i] });
+    }
+    for i in 0..c.cl_ts.len() {
+        let g = c.cl_person[i] as usize;
+        parts[g % NPART].cl.push(Cl { click_id: rank(&c.cl_id[i]), person: (g / NPART) as u32, ts: c.cl_ts[i], camp: c.cl_camp[i] });
+    }
+    Cleaned {
+        base_ms: c.base_ms,
+        ws_ms: c.ws_ms,
+        we_ms: c.we_ms,
+        cat_names: c.cat_names,
+        camp_ids: c.camp_ids,
+        camp_channels: c.camp_channels,
+        parts,
+    }
+}
+
+fn load_flat(data: &Path) -> Flat {
     let (ws, we) = read_manifest(data);
     let base = ws - 7 * DAY_MS;
-    let mut c = Cleaned { base_ms: base, ws_ms: ws, we_ms: we, ..Default::default() };
+    let mut c = Flat { base_ms: base, ws_ms: ws, we_ms: we, ..Default::default() };
 
     // products
     let mut cat_idx: FxHashMap<Vec<u8>, u16> = FxHashMap::default();
