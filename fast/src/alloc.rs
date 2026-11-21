@@ -480,33 +480,60 @@ mod tests {
     }
 }
 
-/// Bump allocator over recycled (already faulted-in) memory.
+/// Bump allocator over recycled (already faulted-in) memory ranges.
 pub struct Bump {
+    ranges: Vec<(usize, usize)>,
+    i: usize,
     p: usize,
-    end: usize,
 }
 
 unsafe impl Send for Bump {}
 
 impl Bump {
-    /// # Safety: [base, base+len) must be writable and unused for the Bump's lifetime (and beyond: slices are 'static).
+    /// # Safety: each range must be writable and unused for the rest of the process (slices are 'static).
     pub unsafe fn new(base: *mut u8, len: usize) -> Self {
-        Bump { p: base as usize, end: base as usize + len }
+        Self::multi(vec![(base, len)])
     }
-    /// Uninitialized room for n Ts, or None if the bump is exhausted.
+    /// # Safety: as `new`, for every range.
+    pub unsafe fn multi(r: Vec<(*mut u8, usize)>) -> Self {
+        let ranges: Vec<(usize, usize)> = r.into_iter().filter(|r| r.1 > 0).map(|(b, l)| (b as usize, b as usize + l)).collect();
+        let p = ranges.first().map_or(0, |r| r.0);
+        Bump { ranges, i: 0, p }
+    }
+    /// Uninitialized room for n Ts, or None if no range has room left.
     pub fn take<T>(&mut self, n: usize) -> Option<*mut T> {
-        let a = (self.p + 63) & !63;
         let need = n * std::mem::size_of::<T>();
-        if a + need > self.end {
-            return None;
+        while self.i < self.ranges.len() {
+            let a = (self.p + 63) & !63;
+            if a + need <= self.ranges[self.i].1 {
+                self.p = a + need;
+                return Some(a as *mut T);
+            }
+            self.i += 1;
+            if self.i < self.ranges.len() {
+                self.p = self.ranges[self.i].0;
+            }
         }
-        self.p = a + need;
-        Some(a as *mut T)
+        None
     }
-    /// The unused rest [p, end).
+    /// Unused memory left: (base, bytes) per range.
+    pub fn rest_all(&self) -> Vec<(*mut u8, usize)> {
+        let mut v = Vec::new();
+        for (j, &(s, e)) in self.ranges.iter().enumerate().skip(self.i) {
+            let a = if j == self.i { (self.p + 63) & !63 } else { s };
+            if e > a {
+                v.push((a as *mut u8, e - a));
+            }
+        }
+        v
+    }
+    /// The unused rest of the current range.
     pub fn rest(&self) -> (*mut u8, usize) {
         let a = (self.p + 63) & !63;
-        (a as *mut u8, self.end.saturating_sub(a))
+        match self.ranges.get(self.i) {
+            Some(&(_, e)) => (a as *mut u8, e.saturating_sub(a)),
+            None => (std::ptr::null_mut(), 0),
+        }
     }
     /// Gives back the tail of the last `take` (used < taken).
     pub fn shrink_last<T>(&mut self, at: *mut T, used: usize) {
@@ -613,5 +640,177 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for DonorAlloc<A> {
             return q;
         }
         self.0.realloc(p, l, new)
+    }
+}
+
+/// Like `WcRegions`, but each region is a chain of 4 KiB blocks carved from
+/// per-owner 64 MiB slabs: no per-region capacity guess, no spill, slack of
+/// at most one block per region, adapts to uneven work per thread.
+pub struct BlockRegions<T: Copy, const K: usize> {
+    stage: Vec<Stage<T, K>>,
+    nst: Vec<u8>,
+    huge: bool,
+    slabs: Vec<(Option<HugeBuf<u8>>, Vec<u8>, *mut u8)>,
+    slab_next: usize,
+    /// per region: block addresses, items in the last block
+    blocks: Vec<Vec<*mut T>>,
+    fill: Vec<u32>,
+    bitems: usize,
+}
+
+unsafe impl<T: Copy + Send, const K: usize> Send for BlockRegions<T, K> {}
+unsafe impl<T: Copy + Sync, const K: usize> Sync for BlockRegions<T, K> {}
+
+const BLK: usize = 32768;
+const SLAB: usize = 64 << 20;
+
+impl<T: Copy, const K: usize> BlockRegions<T, K> {
+    pub fn new(nreg: usize, huge: bool) -> Self {
+        let sz = std::mem::size_of::<T>();
+        assert!((K * sz) % 64 == 0 && std::mem::align_of::<T>() <= 64 && K * sz <= BLK);
+        BlockRegions {
+            stage: vec![Stage(unsafe { std::mem::zeroed() }); nreg],
+            nst: vec![0; nreg],
+            huge,
+            slabs: Vec::new(),
+            slab_next: SLAB,
+            blocks: (0..nreg).map(|_| Vec::new()).collect(),
+            fill: vec![0; nreg],
+            bitems: BLK / (K * sz) * K,
+        }
+    }
+    #[cold]
+    fn new_slab(&mut self) {
+        let (hb, mut vb) = if self.huge { (Some(HugeBuf::<u8>::zeroed(SLAB)), Vec::new()) } else { (None, Vec::<u8>::with_capacity(SLAB + BLK)) };
+        let p = match &hb { Some(h) => h.as_mut_ptr(), None => ((vb.as_mut_ptr() as usize + BLK - 1) & !(BLK - 1)) as *mut u8 };
+        self.slabs.push((hb, vb, p));
+        self.slab_next = 0;
+    }
+    #[inline(always)]
+    fn new_block(&mut self) -> *mut T {
+        if self.slab_next + BLK > SLAB {
+            self.new_slab();
+        }
+        let p = unsafe { self.slabs.last().unwrap().2.add(self.slab_next) } as *mut T;
+        self.slab_next += BLK;
+        p
+    }
+    #[inline(always)]
+    pub fn push(&mut self, r: usize, x: T) {
+        unsafe {
+            let k = *self.nst.get_unchecked(r) as usize;
+            let st = self.stage.get_unchecked_mut(r);
+            *st.0.get_unchecked_mut(k) = x;
+            if k + 1 < K {
+                *self.nst.get_unchecked_mut(r) = (k + 1) as u8;
+            } else {
+                *self.nst.get_unchecked_mut(r) = 0;
+                self.flush_full(r);
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn flush_full(&mut self, r: usize) {
+        let f = *self.fill.get_unchecked(r) as usize;
+        let dst = if f + K <= self.bitems && !self.blocks.get_unchecked(r).is_empty() {
+            self.blocks.get_unchecked(r).last().unwrap().add(f)
+        } else {
+            let b = self.new_block();
+            self.blocks.get_unchecked_mut(r).push(b);
+            *self.fill.get_unchecked_mut(r) = 0;
+            b
+        };
+        let src = self.stage.get_unchecked(r) as *const Stage<T, K> as *const u8;
+        nt_copy(dst as *mut u8, src, K * std::mem::size_of::<T>());
+        *self.fill.get_unchecked_mut(r) += K as u32;
+    }
+    /// Flushes partial stages; afterwards reads see every item.
+    pub fn finish(&mut self) {
+        for r in 0..self.nst.len() {
+            let k = self.nst[r] as usize;
+            let st = self.stage[r];
+            for i in 0..k {
+                let f = self.fill[r] as usize;
+                let dst = if f < self.bitems && !self.blocks[r].is_empty() {
+                    unsafe { self.blocks[r].last().unwrap().add(f) }
+                } else {
+                    let b = self.new_block();
+                    self.blocks[r].push(b);
+                    self.fill[r] = 0;
+                    b
+                };
+                unsafe { dst.write(st.0[i]) };
+                self.fill[r] += 1;
+            }
+            self.nst[r] = 0;
+        }
+        sfence();
+    }
+    #[inline]
+    pub fn len_of(&self, r: usize) -> usize {
+        let nb = self.blocks[r].len();
+        if nb == 0 {
+            0
+        } else {
+            (nb - 1) * self.bitems + self.fill[r] as usize
+        }
+    }
+    #[inline(always)]
+    pub fn at(&self, r: usize, i: usize) -> &T {
+        unsafe { &*self.blocks.get_unchecked(r).get_unchecked(i / self.bitems).add(i % self.bitems) }
+    }
+    #[inline(always)]
+    pub fn each(&self, r: usize, mut f: impl FnMut(usize, &T)) {
+        let bl = &self.blocks[r];
+        let nb = bl.len();
+        let mut idx = 0;
+        for (j, &b) in bl.iter().enumerate() {
+            let n = if j + 1 == nb { self.fill[r] as usize } else { self.bitems };
+            let s = unsafe { std::slice::from_raw_parts(b, n) };
+            for x in s {
+                f(idx, x);
+                idx += 1;
+            }
+        }
+    }
+    /// The slabs (base, bytes), e.g. to recycle them once the regions are dead.
+    pub fn slabs(&self) -> Vec<(*mut u8, usize)> {
+        let n = self.slabs.len();
+        self.slabs.iter().enumerate().map(|(i, s)| (s.2, if i + 1 == n { self.slab_next } else { SLAB })).collect()
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    #[test]
+    fn block_regions_roundtrip() {
+        for &(nreg, per, huge) in &[(256usize, 1000usize, false), (7, 50000, true), (3, 1, false), (1024, 37, true)] {
+            let mut w = BlockRegions::<[u64; 4], 4>::new(nreg, huge);
+            let mut c = BlockRegions::<[u64; 3], 8>::new(nreg, huge);
+            for i in 0..per {
+                for r in 0..nreg {
+                    w.push(r, [r as u64, i as u64, 7, 7]);
+                    c.push(r, [r as u64, i as u64, 9]);
+                }
+            }
+            w.finish();
+            c.finish();
+            for r in 0..nreg {
+                assert_eq!(w.len_of(r), per);
+                assert_eq!(c.len_of(r), per);
+                let mut n = 0;
+                w.each(r, |i, x| {
+                    assert_eq!(*x, [r as u64, i as u64, 7, 7]);
+                    assert_eq!(w.at(r, i), x);
+                    n += 1;
+                });
+                c.each(r, |i, x| {
+                    assert_eq!(*x, [r as u64, i as u64, 9]);
+                    assert_eq!(c.at(r, i), x);
+                });
+                assert_eq!(n, per);
+            }
+        }
     }
 }

@@ -318,7 +318,7 @@ impl Lookups {
 }
 
 struct ParseState<K: IdKey> {
-    ev: WcRegions<ERec<K>, 4>,
+    ev: crate::alloc::BlockRegions<ERec<K>, 4>,
     side: Vec<(u32, u16)>,
     cl: WcRegions<CRec<K>, 8>,
     cbuf: Vec<CRec<K>>,
@@ -459,7 +459,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
         threads,
         chunks.len(),
         |_| ParseState::<K> {
-            ev: WcRegions::new_with(NB, ev_cap, huge),
+            ev: crate::alloc::BlockRegions::new(NB, huge),
             side: Vec::with_capacity(ev_cap * NB / 20),
             cl: WcRegions::new_with(NPART, cl_cap, huge),
             cbuf: Vec::new(),
@@ -713,8 +713,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
         let parts_ref = &parts_out;
         let part_states = par_items(threads, NPART, |t| {
             // recycle this thread's dead event-bucket buffer (dedup is done with it)
-            let (b, l) = states[t.min(states.len() - 1)].ev.raw();
-            (unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }, GMap::<K, u32>::with_capacity(4096), Vec::<K>::new())
+            let slabs = if t < states.len() && recycle { states[t].ev.slabs() } else { Vec::new() };
+            (unsafe { crate::alloc::Bump::multi(slabs) }, GMap::<K, u32>::with_capacity(4096), Vec::<K>::new())
         }, |(bump, local, names), p| {
             let n: usize = deduped.iter().map(|(_, _, _, o, _, _, _)| o.len_of(p)).sum();
             local.clear();
@@ -791,8 +791,9 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
         if std::env::var_os("FAST_NO_DONATE").is_none() {
             unsafe {
                 for (bump, _, _) in part_states.iter() {
-                    let (p, l) = bump.rest();
-                    crate::alloc::donate(p, l);
+                    for (p, l) in bump.rest_all() {
+                        crate::alloc::donate(p, l);
+                    }
                 }
                 for st in states.iter() {
                     let (p, l) = st.cl.raw();
