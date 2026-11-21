@@ -141,6 +141,9 @@ fn zap_input_mappings(data: &std::path::Path, nthreads: usize) {
             x += l;
         }
     }
+    if std::env::var_os("FAST_TIMING").is_some() {
+        eprintln!("zap: {} ranges, {} MB", ranges.len(), ranges.iter().map(|r| r.1).sum::<usize>() >> 20);
+    }
     if ranges.is_empty() {
         return;
     }
