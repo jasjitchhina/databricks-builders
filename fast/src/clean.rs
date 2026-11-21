@@ -101,6 +101,7 @@ fn data_lines(p: &Path, mut f: impl FnMut(&[u8])) {
 
 /// A parsed, well-formed event line with a non-empty event_id.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct ERec<K: IdKey> {
     eid: K,
     user: K,
@@ -109,6 +110,8 @@ struct ERec<K: IdKey> {
     ts: u32,
     /// 0 for view/cart; else 1 + index into the thread's purchase side table.
     pc: u32,
+    /// pads the wide record to 64 bytes (64B-multiple write-combining stages)
+    _pad: K::Pad,
 }
 
 #[derive(Clone, Copy)]
@@ -892,7 +895,7 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
     }
     let ingest = parse_ts_in(m, ing).unwrap_or(i64::MAX);
     let Some(ek) = K::pack(m, eid) else { return Err(()) };
-    let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0 };
+    let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0, _pad: K::Pad::default() };
     'v: {
         if user.is_empty() || prod.is_empty() {
             break 'v;
