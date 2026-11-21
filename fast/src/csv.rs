@@ -407,25 +407,6 @@ pub fn scan_fast<'a, const N: usize, F: FnMut([&'a [u8]; N])>(buf: &'a [u8], sta
         let next = ls + len + 1;
         if commas.count_ones() as usize == N - 1 {
             let q = (q0 as u128 | (q1 as u128) << 64) & below;
-            if q == 0 {
-                // no quote in the line: fields are the raw comma-separated slices
-                let mut fl: [&'a [u8]; N] = [&[]; N];
-                let mut s = ls;
-                for k in 0..N {
-                    let e = if k < N - 1 {
-                        let c = commas.trailing_zeros() as usize;
-                        commas &= commas - 1;
-                        ls + c
-                    } else {
-                        ls + len
-                    };
-                    fl[k] = unsafe { buf.get_unchecked(s..e) };
-                    s = e + 1;
-                }
-                f(fl);
-                ls = next;
-                continue;
-            }
             // Whole-line wrap test (len < 128 and >= N-1 >= 1 here). fs: field starts,
             // fe: field ends (exclusive); N bits each, in field order. Field k is wrapped iff
             // its first and last bytes are '"' and it is at least 2 long; the line is valid iff
