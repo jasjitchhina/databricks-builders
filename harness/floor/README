@@ -1,0 +1,4 @@
+Container overhead floor probes (task 21). gcc -O2 -static [-pthread]; images built FROM floor-distroless / scratch.
+true.c: no-op. alloc.c: touch GB of anon memory (THP=1 madvise hugepage) then _exit, prints MARK realtime.
+touchall.c: mmap+touch every /data CSV page (UNMAP=1 munmap each) then _exit, prints MARK.
+incont.sh "ENV": scorer-flag run on cpuset 0-7 (take flock -x /tmp/bench.lock first), prints start->MARK, MARK->exit.
