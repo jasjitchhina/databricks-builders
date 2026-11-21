@@ -32,6 +32,15 @@ trap 'rm -rf "$WORK" 2>/dev/null' EXIT
 FAILS=()
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)
 
+echo "== [0] lint"
+LINT=$(git -C "$ROOT" grep -nIE 'target-cpu *= *native|target-cpu=native|-march=native|avx512' -- ':!verify.sh' ':!*.md' 2>/dev/null || true)
+if [ -n "$LINT" ]; then echo "FAIL lint: native/avx512 codegen flags found:"; echo "$LINT"; FAILS+=(lint-native); fi
+SIZE_KB=$(git -C "$ROOT" ls-files -z | (cd "$ROOT" && xargs -0 du -ck 2>/dev/null) | tail -1 | cut -f1)
+if [ "${SIZE_KB:-0}" -gt 45000 ]; then echo "FAIL lint: tracked files ${SIZE_KB} KB (limit 50 MB)"; FAILS+=(lint-size); fi
+BIG=$(git -C "$ROOT" ls-files | grep -E '\.(parquet|csv)$' | grep -vE '^(fixtures|dev-answer)/' || true)
+if [ -n "$BIG" ]; then echo "FAIL lint: data files tracked: $BIG"; FAILS+=(lint-data); fi
+[ ${#FAILS[@]} -eq 0 ] && echo "ok   lint (tracked ${SIZE_KB} KB)"
+
 echo "== [1] fixtures ($TARGET)"
 if python3 "$ROOT/scripts/run_fixtures.py" "$ROOT/fixtures" -- "$RUN" > "$WORK/fixtures.txt" 2>&1; then
   tail -1 "$WORK/fixtures.txt"
