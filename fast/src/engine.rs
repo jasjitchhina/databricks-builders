@@ -715,3 +715,51 @@ fn flush_day(
     }
     *urows += 1;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// radix_ts must equal a stable-irrelevant sort by the top 31 bits for every
+    /// combination of skipped digit passes (constant digits), sizes and payloads.
+    #[test]
+    fn radix_ts_matches_sort() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut tmp = Vec::new();
+        for case in 0..2000 {
+            let n = [0, 1, 2, 513, 600, 4096, 70_000][case % 7];
+            // which of the 3 digits (11/11/9 bits of ts) vary: bit mask
+            let vary = case % 8;
+            let base_ts = (rnd() & 0x7FFF_FFFF) as u32;
+            let mut v: Vec<u64> = (0..n)
+                .map(|_| {
+                    let r = (rnd() & 0x7FFF_FFFF) as u32;
+                    let mut ts = base_ts;
+                    for (d, (sh, w)) in [(0u32, 11u32), (11, 11), (22, 9)].iter().enumerate() {
+                        if vary & (1 << d) != 0 {
+                            let m = ((1u32 << w) - 1) << sh;
+                            ts = (ts & !m) | (r & m);
+                        }
+                    }
+                    ((ts as u64) << 33) | (rnd() & ((1 << 33) - 1))
+                })
+                .collect();
+            let mut want: Vec<u32> = v.iter().map(|x| (x >> 33) as u32).collect();
+            want.sort_unstable();
+            let mut payload: Vec<u64> = v.clone();
+            payload.sort_unstable();
+            radix_ts(&mut v, &mut tmp);
+            let got: Vec<u32> = v.iter().map(|x| (x >> 33) as u32).collect();
+            assert_eq!(got, want, "case {case} n {n} vary {vary}");
+            let mut multiset = v.clone();
+            multiset.sort_unstable();
+            assert_eq!(multiset, payload, "payloads lost, case {case}");
+        }
+    }
+}

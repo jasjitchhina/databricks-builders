@@ -11,10 +11,14 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let data = PathBuf::from(args.get(1).cloned().or_else(|| std::env::var("DATA_DIR").ok()).unwrap_or("/data".into()));
-    let out = PathBuf::from(args.get(2).cloned().or_else(|| std::env::var("OUTPUT_DIR").ok()).unwrap_or("/output".into()));
-    let nthreads: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+    // Env robustness: empty values count as unset; NCPU is trimmed, 0/garbage falls back
+    // to the CPUs this process may use (affinity + cgroup quota), and is clamped to
+    // [1, 64] so a bogus value can never exhaust the 4096-pid limit.
+    let env = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let data = PathBuf::from(args.get(1).cloned().or_else(|| env("DATA_DIR")).unwrap_or("/data".into()));
+    let out = PathBuf::from(args.get(2).cloned().or_else(|| env("OUTPUT_DIR")).unwrap_or("/output".into()));
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let nthreads: usize = env("NCPU").and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(avail).clamp(1, 64);
     fast::set_threads(nthreads);
     let dump = std::env::var("DUMP_DIR").ok().map(PathBuf::from);
     let verbose = std::env::var("FAST_TIMING").is_ok();
@@ -73,6 +77,7 @@ fn main() {
     // allocations is pure waste) and pre-clear page tables in parallel so the
     // single-threaded exit teardown has little left to do.
     if std::env::var_os("FAST_NO_ZAP").is_none() {
+        cov_flush();
         zap_and_exit(&data, nthreads, std::env::var_os("FAST_NO_ZAP_ANON").is_none(), verbose);
     }
     std::process::exit(0);
@@ -227,3 +232,16 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     }
     unsafe { libc::_exit(0) }
 }
+
+/// Coverage builds (feature "cov", -C instrument-coverage): write the profile
+/// before _exit skips the runtime's atexit writer.
+#[cfg(feature = "cov")]
+fn cov_flush() {
+    extern "C" {
+        fn __llvm_profile_write_file() -> i32;
+    }
+    unsafe { __llvm_profile_write_file() };
+}
+#[cfg(not(feature = "cov"))]
+#[inline(always)]
+fn cov_flush() {}
