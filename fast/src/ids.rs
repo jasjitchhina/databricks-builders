@@ -205,6 +205,11 @@ pub struct ShardedMap {
     slots: crate::alloc::HugeBuf<(Key, Key)>,
     shard_bits: u32,
     mask: usize,
+    /// Blocked Bloom filter over the inserted keys (one u64 word per key, 3 bits).
+    /// No false negatives, so a negative answer is exact: the key is not in the map.
+    /// Small enough to stay cache-resident while the map itself is DRAM-sized.
+    filter: Vec<std::sync::atomic::AtomicU64>,
+    fmask: usize,
 }
 
 impl ShardedMap {
@@ -216,7 +221,31 @@ impl ShardedMap {
     /// `max_per_shard` = the most entries any shard will get.
     pub fn new(max_per_shard: usize) -> Self {
         let per = (max_per_shard * 2).next_power_of_two().max(16);
-        ShardedMap { slots: crate::alloc::HugeBuf::zeroed(per * Self::SHARDS), shard_bits: per.trailing_zeros(), mask: per - 1 }
+        // ~16 filter bits per entry (upper bound: SHARDS * max_per_shard entries), in u64 words
+        let words = (max_per_shard * Self::SHARDS * 16 / 64).next_power_of_two().max(8);
+        ShardedMap {
+            slots: crate::alloc::HugeBuf::zeroed(per * Self::SHARDS),
+            shard_bits: per.trailing_zeros(),
+            mask: per - 1,
+            filter: (0..words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            fmask: words - 1,
+        }
+    }
+    /// filter word index and bit mask from a second, independent hash of the key
+    #[inline(always)]
+    fn fbits(&self, k: Key) -> (usize, u64) {
+        let mut x = (k as u64).rotate_left(17) ^ ((k >> 64) as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        x ^= x >> 32;
+        x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 29;
+        let w = (x as usize) & self.fmask;
+        let b = (1u64 << ((x >> 40) & 63)) | (1u64 << ((x >> 46) & 63)) | (1u64 << ((x >> 52) & 63));
+        (w, b)
+    }
+    #[inline(always)]
+    fn maybe(&self, k: Key) -> bool {
+        let (w, b) = self.fbits(k);
+        unsafe { self.filter.get_unchecked(w) }.load(std::sync::atomic::Ordering::Relaxed) & b == b
     }
     /// Inserts into shard `s` (k must belong to it). Distinct shards may be
     /// filled concurrently from different threads.
@@ -228,6 +257,8 @@ impl ShardedMap {
             let e = &mut *base.add(i);
             if e.0 == 0 || e.0 == k {
                 *e = (k, v);
+                let (w, b) = self.fbits(k);
+                self.filter[w].fetch_or(b, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             i = (i + 1) & self.mask;
@@ -241,6 +272,9 @@ impl ShardedMap {
     }
     #[inline(always)]
     pub fn get(&self, k: Key) -> Option<Key> {
+        if !self.maybe(k) {
+            return None;
+        }
         let (base, mut i) = self.slot_ptr(k);
         loop {
             let e = unsafe { &*base.add(i) };
@@ -257,5 +291,18 @@ impl ShardedMap {
     pub fn prefetch(&self, k: Key) {
         let (base, i) = self.slot_ptr(k);
         prefetch(unsafe { base.add(i) } as *const u8);
+    }
+    /// stage 1 of a 2-stage pipeline: bring the filter word in
+    #[inline(always)]
+    pub fn prefetch_filter(&self, k: Key) {
+        let (w, _) = self.fbits(k);
+        prefetch(unsafe { self.filter.as_ptr().add(w) } as *const u8);
+    }
+    /// stage 2: filter word is (likely) cached; prefetch the slot only if the key may be present
+    #[inline(always)]
+    pub fn prefetch_if(&self, k: Key) {
+        if self.maybe(k) {
+            self.prefetch(k);
+        }
     }
 }
