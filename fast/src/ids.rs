@@ -198,22 +198,64 @@ pub fn prefetch(p: *const u8) {
     }
 }
 
-/// KeyMap sharded by the top 8 bits of the hash, so shards can be built in parallel.
+/// Read-only Key -> Key map: 256 open-addressing shards (by the top 8 hash
+/// bits) laid out in one hugepage buffer, so shards build in parallel and
+/// lookups do not miss the TLB.
 pub struct ShardedMap {
-    pub shards: Vec<KeyMap>,
+    slots: crate::alloc::HugeBuf<(Key, Key)>,
+    shard_bits: u32,
+    mask: usize,
 }
 
 impl ShardedMap {
+    pub const SHARDS: usize = 256;
     #[inline(always)]
     pub fn shard_of(k: Key) -> usize {
         (hk(k) >> 56) as usize
     }
+    /// `max_per_shard` = the most entries any shard will get.
+    pub fn new(max_per_shard: usize) -> Self {
+        let per = (max_per_shard * 2).next_power_of_two().max(16);
+        ShardedMap { slots: crate::alloc::HugeBuf::zeroed(per * Self::SHARDS), shard_bits: per.trailing_zeros(), mask: per - 1 }
+    }
+    /// Inserts into shard `s` (k must belong to it). Distinct shards may be
+    /// filled concurrently from different threads.
+    #[inline(always)]
+    pub unsafe fn insert_shard(&self, s: usize, k: Key, v: Key) {
+        let base = self.slots.as_mut_ptr().add(s << self.shard_bits);
+        let mut i = hk(k) as usize & self.mask;
+        loop {
+            let e = &mut *base.add(i);
+            if e.0 == 0 || e.0 == k {
+                *e = (k, v);
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn slot_ptr(&self, k: Key) -> (*const (Key, Key), usize) {
+        let h = hk(k);
+        let base = unsafe { self.slots.as_ptr().add(((h >> 56) as usize) << self.shard_bits) };
+        (base, h as usize & self.mask)
+    }
     #[inline(always)]
     pub fn get(&self, k: Key) -> Option<Key> {
-        unsafe { self.shards.get_unchecked(Self::shard_of(k)) }.get(k)
+        let (base, mut i) = self.slot_ptr(k);
+        loop {
+            let e = unsafe { &*base.add(i) };
+            if e.0 == 0 {
+                return None;
+            }
+            if e.0 == k {
+                return Some(e.1);
+            }
+            i = (i + 1) & self.mask;
+        }
     }
     #[inline(always)]
     pub fn prefetch(&self, k: Key) {
-        unsafe { self.shards.get_unchecked(Self::shard_of(k)) }.prefetch(k)
+        let (base, i) = self.slot_ptr(k);
+        prefetch(unsafe { base.add(i) } as *const u8);
     }
 }

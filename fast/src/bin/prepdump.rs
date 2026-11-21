@@ -2,6 +2,9 @@
 //! events_fast.csv (person,ts_ms,price,category) and clicks_fast.csv
 //! (click_id,person,campaign_id,ts_ms), both sorted, for diffing vs the oracle.
 use fast::clean::clean;
+#[cfg(feature = "huge")]
+#[global_allocator]
+static A: fast::alloc::HugeAlloc = fast::alloc::HugeAlloc;
 use std::io::Write;
 
 fn s(b: &[u8]) -> String {
@@ -18,6 +21,9 @@ fn main() {
     let nc: usize = c.parts.iter().map(|p| p.cl.len()).sum();
     let np: usize = c.parts.iter().map(|p| p.person_names.len()).sum();
     eprintln!("events {ne} clicks {nc} persons {np}");
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    eprintln!("rusage: user {:.0} ms sys {:.0} ms minflt {} maxrss {} MB", ru.ru_utime.tv_sec as f64 * 1e3 + ru.ru_utime.tv_usec as f64 / 1e3, ru.ru_stime.tv_sec as f64 * 1e3 + ru.ru_stime.tv_usec as f64 / 1e3, ru.ru_minflt, ru.ru_maxrss / 1024);
     if a.len() < 3 {
         return;
     }

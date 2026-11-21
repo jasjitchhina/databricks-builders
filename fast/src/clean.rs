@@ -235,19 +235,21 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             }
         }
     }
-    let shards: Vec<Mutex<Option<KeyMap>>> = (0..LS).map(|_| Mutex::new(None)).collect();
+    let mut per_shard = vec![0usize; LS];
+    for s in 0..LS {
+        per_shard[s] = (0..shard_keys[s].len()).filter(|&l| name[roots[base[s] as usize + l] as usize] != shard_keys[s][l]).count();
+    }
+    let map = ShardedMap::new(per_shard.iter().copied().max().unwrap_or(0));
     par_items(threads, LS, |_| (), |_, s| {
         let keys = &shard_keys[s];
-        let mut tab = KeyMap::with_capacity(keys.len());
         for (l, &k) in keys.iter().enumerate() {
             let nm = name[roots[base[s] as usize + l] as usize];
             if nm != k {
-                tab.insert(k, nm);
+                unsafe { map.insert_shard(s, k, nm) };
             }
         }
-        *shards[s].lock().unwrap() = Some(tab);
     });
-    ShardedMap { shards: shards.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect() }
+    map
 }
 
 struct Lookups {
@@ -399,8 +401,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             let get = |r: u32| -> &ERec { unsafe { states.get_unchecked((r >> 26) as usize).ev.get_unchecked(b).get_unchecked((r & ((1 << 26) - 1)) as usize) } };
             losers.clear();
             for (ti, s) in states.iter().enumerate() {
-                let v = &s.ev[b];
-                for (ri, r) in v.iter().enumerate() {
+                s.ev[b].iter().enumerate().for_each(|(ri, r)| {
                     let h = hk(r.eid);
                     let tag = h >> 32;
                     let mut i = (h >> NB_BITS) as usize & mask;
@@ -426,24 +427,24 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                         }
                         i = (i + 1) & mask;
                     }
-                }
+                });
             }
             losers.sort_unstable();
             surv.clear();
             let mut li = 0;
             for (ti, s) in states.iter().enumerate() {
-                for (ri, r) in s.ev[b].iter().enumerate() {
+                s.ev[b].iter().enumerate().for_each(|(ri, r)| {
                     let me = ((ti as u32) << 26) | ri as u32;
                     if li < losers.len() && losers[li] == me {
                         li += 1;
-                        continue;
+                        return;
                     }
                     if r.ts == NOT_OK {
-                        continue;
+                        return;
                     }
                     let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
                     surv.push((r.user, r.ts, price, cat));
-                }
+                });
             }
             let n = surv.len();
             for j in 0..n {
@@ -469,7 +470,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             let mut names: Vec<Key> = Vec::new();
             let mut ev: Vec<Ev> = Vec::with_capacity(n);
             for (_, _, _, o) in deduped.iter() {
-                for r in &o[p] {
+                o[p].iter().for_each(|r| {
                     let id = match local.get(r.person) {
                         Some(v) => v as u32,
                         None => {
@@ -480,15 +481,15 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                         }
                     };
                     ev.push(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat });
-                }
+                });
             }
             let mut cl: Vec<Cl> = Vec::new();
             for s in states.iter() {
-                for r in &s.cl[p] {
+                s.cl[p].iter().for_each(|r| {
                     if let Some(v) = local.get(r.person) {
                         cl.push(Cl { click_id: r.cid, person: v as u32, ts: r.ts, camp: r.camp });
                     }
-                }
+                });
             }
             let person_names = names.into_iter().map(key_bytes).collect();
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
