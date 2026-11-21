@@ -592,8 +592,7 @@ fn process_person<E: EvT, C: ClT>(
         debug_assert!(((day - day0) as usize) < ctx.ndays);
 
         // attribution window [start - 7d, start]
-        let v7 = VARIANT.load(Relaxed) == 7;
-        while !v7 && hi < pc.len() && pc[hi].ts() <= start {
+        while hi < pc.len() && pc[hi].ts() <= start {
             let k = pc[hi].camp() as usize;
             unsafe {
                 let c = cnt.get_unchecked_mut(k);
@@ -622,7 +621,7 @@ fn process_person<E: EvT, C: ClT>(
             let t = pc[hi - 1].ts();
             let mut best = hi - 1;
             let mut q = hi - 1;
-            while VARIANT.load(Relaxed) != 6 && q > lo && pc[q - 1].ts() == t {
+            while q > lo && pc[q - 1].ts() == t {
                 q -= 1;
                 if pc[q].cid(part) < pc[best].cid(part) {
                     best = q;
