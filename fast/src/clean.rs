@@ -304,42 +304,17 @@ struct Lookups {
     products: KeyMap, // product key -> cat idx
     unknown_cat: u16,
     campaigns: KeyMap, // campaign key -> idx
-    /// Same maps on compact keys, when every catalog ID is compact. Exact: a
-    /// field that is not compact cannot equal any (compact) catalog ID.
-    prod64: Option<GMap<u64, u16>>,
-    camp64: Option<GMap<u64, u16>>,
 }
 
 impl Lookups {
     #[inline(always)]
     fn campaign(&self, m: &[u8], f: &[u8]) -> Option<u16> {
-        match &self.camp64 {
-            Some(c) => <u64 as IdKey>::pack(m, f).and_then(|k| if k == 0 { None } else { c.get(k) }),
-            None => self.campaigns.get(pack_in(m, f)).map(|v| v as u16),
-        }
+        self.campaigns.get(pack_in(m, f)).map(|v| v as u16)
     }
     #[inline(always)]
     fn category(&self, m: &[u8], f: &[u8]) -> u16 {
-        let c = match &self.prod64 {
-            Some(p) => <u64 as IdKey>::pack(m, f).and_then(|k| if k == 0 { None } else { p.get(k) }),
-            None => self.products.get(pack_in(m, f)).map(|v| v as u16),
-        };
-        c.unwrap_or(self.unknown_cat)
+        self.products.get(pack_in(m, f)).map_or(self.unknown_cat, |v| v as u16)
     }
-}
-
-fn compact_map(ids: impl Iterator<Item = (Box<[u8]>, u16)>) -> Option<GMap<u64, u16>> {
-    let mut m: GMap<u64, u16> = GMap::with_capacity(1024);
-    for (id, v) in ids {
-        let k = <u64 as IdKey>::pack(&id, &id)?;
-        if k == 0 {
-            return None; // empty catalog ID: keep the general path
-        }
-        if m.get_or_insert(k, v).is_some() {
-            return None; // duplicate: keep first-wins semantics of the general path
-        }
-    }
-    Some(m)
 }
 
 struct ParseState<K: IdKey> {
@@ -377,19 +352,28 @@ pub fn click_id_bytes(k: u128) -> Box<[u8]> {
 }
 
 pub fn clean(dir: &Path, threads: usize) -> Cleaned {
-    let small = read_small(dir);
-    WIDE_USED.store(false, Ordering::Relaxed);
-    if std::env::var_os("FAST_WIDE").is_none() {
-        if let Some(c) = clean_impl::<u64>(dir, threads, &small) {
-            return c;
+    // products/campaigns/manifest load on a side thread while links stage 1 runs
+    let small_cell: std::sync::OnceLock<Small> = std::sync::OnceLock::new();
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let t0 = Instant::now();
+            let _ = small_cell.set(read_small(dir));
+            if std::env::var_os("FAST_VERBOSE").is_some() {
+                eprintln!("[clean] small files    {:>8.1} ms (side thread)", t0.elapsed().as_secs_f64() * 1e3);
+            }
+        });
+        WIDE_USED.store(false, Ordering::Relaxed);
+        if std::env::var_os("FAST_WIDE").is_none() {
+            if let Some(c) = clean_impl::<u64>(dir, threads, &small_cell) {
+                return c;
+            }
+            if std::env::var_os("FAST_VERBOSE").is_some() {
+                eprintln!("[clean] an ID is not compact: rerunning with u128 keys");
+            }
         }
         WIDE_USED.store(true, Ordering::Relaxed);
-        if std::env::var_os("FAST_VERBOSE").is_some() {
-            eprintln!("[clean] an ID is not compact: rerunning with u128 keys");
-        }
-    }
-    WIDE_USED.store(true, Ordering::Relaxed);
-    clean_impl::<u128>(dir, threads, &small).expect("u128 keys represent every ID")
+        clean_impl::<u128>(dir, threads, &small_cell).expect("u128 keys represent every ID")
+    })
 }
 
 fn read_small(dir: &Path) -> Small {
@@ -399,24 +383,23 @@ fn read_small(dir: &Path) -> Small {
     // products / campaigns
     let mut cat_names: Vec<Box<[u8]>> = Vec::new();
     let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
-    let mut prod_rows: Vec<(Key, u16)> = Vec::new();
-    let mut prod_rows_raw: Vec<(Box<[u8]>, u16)> = Vec::new();
+    let mut products = KeyMap::with_capacity(1 << 16);
     data_lines(&dir.join("products.csv"), |line| {
         if let Some([p, c]) = csv::split::<2>(line) {
-            let ci = *cat_idx.entry(c.to_vec()).or_insert_with(|| {
-                cat_names.push(c.into());
-                (cat_names.len() - 1) as u16
-            });
-            prod_rows.push((pack(p), ci));
-            prod_rows_raw.push((p.into(), ci));
+            let ci = match cat_idx.get(c) {
+                Some(&ci) => ci,
+                None => {
+                    cat_names.push(c.into());
+                    let ci = (cat_names.len() - 1) as u16;
+                    cat_idx.insert(c.to_vec(), ci);
+                    ci
+                }
+            };
+            products.insert(pack(p), ci as Key);
         }
     });
     let unknown_cat = cat_names.len() as u16;
     cat_names.push(b"unknown"[..].into());
-    let mut products = KeyMap::with_capacity(prod_rows.len());
-    for &(k, c) in &prod_rows {
-        products.insert(k, c as Key);
-    }
     let mut camp_ids: Vec<Box<[u8]>> = Vec::new();
     let mut camp_channels: Vec<Box<[u8]>> = Vec::new();
     data_lines(&dir.join("campaigns.csv"), |line| {
@@ -429,21 +412,19 @@ fn read_small(dir: &Path) -> Small {
     for (i, c) in camp_ids.iter().enumerate() {
         campaigns.insert(pack(c), i as Key);
     }
-    let prod_bytes: Vec<(Box<[u8]>, u16)> = prod_rows_raw.iter().map(|(p, c)| (p.clone(), *c)).collect();
-    // Compact catalog maps measured no faster than the u128 ones (A/B, HT-like); kept off.
-    let _ = (prod_bytes, compact_map as fn(std::vec::IntoIter<(Box<[u8]>, u16)>) -> Option<GMap<u64, u16>>);
-    let (prod64, camp64) = (None, None);
-    let lk = Lookups { products, unknown_cat, campaigns, prod64, camp64 };
+    let lk = Lookups { products, unknown_cat, campaigns };
     Small { ws, we, base, lk, cat_names, camp_ids, camp_channels }
 }
 
-fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cleaned> {
+fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::OnceLock<Small>) -> Option<Cleaned> {
     let mut t = timer();
-    let (ws, we, base, lk) = (small.ws, small.we, small.base, &small.lk);
-    let unknown_cat = lk.unknown_cat;
     let bad = AtomicBool::new(false);
     let pre = links_stage1::<K>(dir, threads)?;
     t("links stage1");
+    let small = small_cell.wait();
+    t("small wait");
+    let (ws, we, base, lk) = (small.ws, small.we, small.base, &small.lk);
+    let unknown_cat = lk.unknown_cat;
     // Stage 2 of links runs on its own thread while the workers parse events;
     // click chunks (which need person = link name) come last and wait for it.
     let link_cell: std::sync::OnceLock<GSharded<K>> = std::sync::OnceLock::new();
@@ -896,7 +877,7 @@ pub fn microbench(dir: &Path) {
             products.insert(pack(p), 1);
         }
     });
-    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16), prod64: None, camp64: None };
+    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16) };
     let mut data: Vec<u8> = Vec::new();
     for f in csv::list_csv(&dir.join("events")) {
         let b = std::fs::read(f).unwrap();
