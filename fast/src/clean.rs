@@ -520,7 +520,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                         return;
                     }
                     let Some(ci) = lk.campaign(m, camp) else { return };
-                    let (Some(ck), Some(uk)) = (K::pack(m, cid), K::pack(m, user)) else {
+                    let (Some(ck), Some(uk)) = K::pack2(m, cid, user) else {
                         ok = false;
                         return;
                     };
@@ -908,7 +908,9 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
     // rules.md: ingest_ts is always valid F1 (trusted fast path, guarded by shape;
     // FAST_STRICT_INGEST=1 validates it like ts)
     let ingest = if lk.strict_ingest { parse_ts_in(m, ing) } else { parse_ingest_in(m, ing) }.unwrap_or(i64::MAX);
-    let Some(ek) = K::pack(m, eid) else { return Err(()) };
+    // both IDs in one vector pass; the user key only matters for valid rows
+    let (ek, uk) = K::pack2(m, eid, user);
+    let Some(ek) = ek else { return Err(()) };
     let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0 };
     'v: {
         if user.is_empty() || prod.is_empty() {
@@ -931,7 +933,7 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
             }
             _ => break 'v,
         };
-        let Some(uk) = K::pack(m, user) else { return Err(()) };
+        let Some(uk) = uk else { return Err(()) };
         rec.user = uk;
         rec.pc = pc;
         rec.ts = (t - base) as u32;
