@@ -70,6 +70,12 @@ check() {  # check NAME DATA ANSWER
   else
     echo "FAIL $name"; cat "$WORK/cmp-$name.txt"; FAILS+=("$name")
   fi
+  if [ "$name" = dev ] || [ "$name" = adv-synth-s2 ]; then  # independent Parquet readers (pyarrow full validate + DuckDB)
+    docker image inspect harness-py:latest >/dev/null 2>&1 || flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 -t harness-py:latest "$ROOT/harness/pyimg" >/dev/null
+    if docker run --rm --network none --cpuset-cpus 8-15 -v "$out":/o:ro -v "$ROOT/harness":/h:ro harness-py:latest python3 /h/pqcheck.py /o > "$WORK/pq-$name.txt" 2>&1; then
+      echo "ok   $name parquet readers (pyarrow+duckdb)"
+    else echo "FAIL $name parquet readers"; cat "$WORK/pq-$name.txt"; FAILS+=("$name:parquet"); fi
+  fi
   rm -rf "$out" 2>/dev/null
 }
 
