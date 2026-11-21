@@ -423,7 +423,20 @@ fn read_small(dir: &Path) -> Small {
 fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::OnceLock<Small>) -> Option<Cleaned> {
     let mut t = timer();
     let bad = AtomicBool::new(false);
-    let pre = links_stage1::<K>(dir, threads)?;
+    // list + map + chunk the event/click files on a side thread while links stage 1 runs
+    let (pre, (n_ev_files, maps, mut chunks)) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            let ev_files = csv::list_csv(&dir.join("events"));
+            let cl_files = csv::list_csv(&dir.join("clicks"));
+            let n_ev_files = ev_files.len();
+            let maps: Vec<Option<Mmap>> = ev_files.iter().chain(cl_files.iter()).map(|p| csv::map(p)).collect();
+            let chunks: Vec<Chunk> = csv::chunks(&maps, CHUNK);
+            (n_ev_files, maps, chunks)
+        });
+        let pre = links_stage1::<K>(dir, threads);
+        (pre, h.join().unwrap())
+    });
+    let pre = pre?;
     t("links stage1");
     let small = small_cell.wait();
     t("small wait");
@@ -434,12 +447,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let link_cell: std::sync::OnceLock<GSharded<K>> = std::sync::OnceLock::new();
     let link_thread_done = AtomicBool::new(false);
 
-    // events + clicks
-    let ev_files = csv::list_csv(&dir.join("events"));
-    let cl_files = csv::list_csv(&dir.join("clicks"));
-    let n_ev_files = ev_files.len();
-    let maps: Vec<Option<Mmap>> = ev_files.iter().chain(cl_files.iter()).map(|p| csv::map(p)).collect();
-    let mut chunks: Vec<Chunk> = csv::chunks(&maps, CHUNK);
+    // events + clicks (files mapped and chunked above)
     // events first (no links needed), then clicks (wait for links stage 2)
     chunks.sort_by_key(|c| (c.file >= n_ev_files) as u8);
     let ev_bytes: usize = maps[..n_ev_files].iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
