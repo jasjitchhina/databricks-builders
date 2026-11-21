@@ -4,7 +4,7 @@ use crate::alloc::WcRegions;
 use crate::csv::{self, pack_in, Chunk};
 use crate::ids::{key_cmp, pack, Key, KeyMap, NPART};
 use crate::keys::{part_of, part_of_h, GMap, GSharded, IdKey};
-use crate::model::{Cl, Cleaned, Ev, Part};
+use crate::model::{Cl, Cleaned, Ev, Part, Rows};
 use crate::ts::{parse_ts, parse_ts_in, DAY_MS};
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -653,15 +653,28 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     t("dedup");
 
     // per part: dense person ids, clicks
+    let recycle = std::env::var_os("FAST_NO_RECYCLE").is_none();
     let deduped = &deduped;
     let mut parts_out: Vec<Mutex<Option<Part>>> = (0..NPART).map(|_| Mutex::new(None)).collect();
     {
         let parts_ref = &parts_out;
-        par_items(threads, NPART, |_| (), |_, p| {
+        par_items(threads, NPART, |t| {
+            // recycle this thread's dead event-bucket buffer (dedup is done with it)
+            let (b, l) = states[t.min(states.len() - 1)].ev.raw();
+            unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }
+        }, |bump, p| {
             let n: usize = deduped.iter().map(|(_, _, _, o)| o.len_of(p)).sum();
             let mut local: GMap<K, u32> = GMap::with_capacity(1024);
             let mut names: Vec<K> = Vec::new();
-            let mut ev: Vec<Ev> = Vec::with_capacity(n);
+            let mut ev_vec: Vec<Ev> = Vec::new();
+            let ev_ptr: *mut Ev = match bump.take::<Ev>(n) {
+                Some(q) => q,
+                None => {
+                    ev_vec.reserve_exact(n);
+                    ev_vec.as_mut_ptr()
+                }
+            };
+            let mut ne = 0usize;
             for (_, _, _, o) in deduped.iter() {
                 o.each(p, |_, r| {
                     let id = match local.get_or_insert(r.person, names.len() as u32) {
@@ -671,17 +684,41 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                             (names.len() - 1) as u32
                         }
                     };
-                    ev.push(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat });
+                    unsafe { ev_ptr.add(ne).write(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat }) };
+                    ne += 1;
                 });
             }
-            let mut cl: Vec<Cl> = Vec::new();
+            let ev = if ev_vec.capacity() > 0 || n == 0 {
+                unsafe { ev_vec.set_len(ne) };
+                Rows::Owned(ev_vec)
+            } else {
+                Rows::Static(unsafe { std::slice::from_raw_parts_mut(ev_ptr, ne) })
+            };
+            let ncl_max: usize = states.iter().map(|s| s.cl.len_of(p)).sum();
+            let mut cl_vec: Vec<Cl> = Vec::new();
+            let cl_ptr: *mut Cl = match bump.take::<Cl>(ncl_max) {
+                Some(q) => q,
+                None => {
+                    cl_vec.reserve_exact(ncl_max);
+                    cl_vec.as_mut_ptr()
+                }
+            };
+            let mut nc = 0usize;
             for s in states.iter() {
                 s.cl.each(p, |_, r| {
                     if let Some(v) = local.get(r.person) {
-                        cl.push(Cl { click_id: r.cid.click(), person: v, ts: r.ts, camp: r.camp });
+                        unsafe { cl_ptr.add(nc).write(Cl { click_id: r.cid.click(), person: v, ts: r.ts, camp: r.camp }) };
+                        nc += 1;
                     }
                 });
             }
+            let cl = if cl_vec.capacity() > 0 || ncl_max == 0 {
+                unsafe { cl_vec.set_len(nc) };
+                Rows::Owned(cl_vec)
+            } else {
+                bump.shrink_last(cl_ptr, nc);
+                Rows::Static(unsafe { std::slice::from_raw_parts_mut(cl_ptr, nc) })
+            };
             let person_names = names.into_iter().map(|k| k.bytes()).collect();
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
         });
