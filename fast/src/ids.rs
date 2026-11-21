@@ -158,11 +158,11 @@ impl KeyMap {
         let mut i = hk(k) as usize & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
-            if s.0 == k {
-                return Some(s.1);
-            }
             if s.0 == 0 {
                 return None;
+            }
+            if s.0 == k {
+                return Some(s.1);
             }
             i = (i + 1) & self.mask;
         }

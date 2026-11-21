@@ -29,8 +29,8 @@ for l in rows(f"{od}/clicks_clean.csv"):
     if person in persons:
         cl.append(l)
 ok = True
-for name, mine, theirs in [("events", sorted(open(f"{fd}/events_fast.csv","rb").read().splitlines()), sorted(ev)),
-                           ("clicks", sorted(open(f"{fd}/clicks_fast.csv","rb").read().splitlines()), sorted(cl))]:
+for name, mine, theirs in [("events", sorted(open(f"{fd}/events_fast.csv","rb").read().split(b"\n")[:-1]), sorted(ev)),
+                           ("clicks", sorted(open(f"{fd}/clicks_fast.csv","rb").read().split(b"\n")[:-1]), sorted(cl))]:
     a, b = set(mine), set(theirs)
     if mine == theirs:
         print(f"{name}: MATCH ({len(mine)} rows)")
