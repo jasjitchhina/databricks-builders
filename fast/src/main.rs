@@ -1,4 +1,8 @@
 use std::path::PathBuf;
+
+#[cfg(feature = "hugealloc")]
+#[global_allocator]
+static A: fast::alloc::HugeAlloc = fast::alloc::HugeAlloc;
 use std::time::Instant;
 
 fn main() {
@@ -30,6 +34,18 @@ fn main() {
         std::fs::write(d.join("sessions.csv"), buf).unwrap();
     }
     if verbose {
+        eprintln!("main total {:?}", t0.elapsed());
+        if std::env::var("FAST_SMAPS").is_ok() {
+            let _ = std::fs::copy("/proc/self/smaps", std::env::var("FAST_SMAPS").unwrap());
+        }
+        if std::env::var("FAST_MEM").is_ok() { if let Ok(st) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            let v: Vec<&str> = st.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge")).collect();
+            eprintln!("{}", v.join(" | ").split_whitespace().collect::<Vec<_>>().join(" "));
+        }}
+        if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+            let v: Vec<&str> = st.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("RssAnon") || l.starts_with("RssFile") || l.starts_with("VmHWM") || l.starts_with("VmPTE")).collect();
+            eprintln!("{}", v.join(" | ").split_whitespace().collect::<Vec<_>>().join(" "));
+        }
         eprintln!(
             "load {:?} engine {:?} write {:?} | events {} clicks {} persons {}",
             t1 - t0, t2 - t1, t3 - t2, c.parts.iter().map(|p| p.ev.len()).sum::<usize>(), c.parts.iter().map(|p| p.cl.len()).sum::<usize>(), c.parts.iter().map(|p| p.person_names.len()).sum::<usize>()
@@ -41,6 +57,10 @@ fn main() {
             eprintln!("drop {:?}", t.elapsed());
             return;
         }
+    }
+    if verbose {
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        eprintln!("end_epoch_ns {ns}");
     }
     // Skip destructors: freeing millions of small allocations at exit is pure waste.
     std::process::exit(0);

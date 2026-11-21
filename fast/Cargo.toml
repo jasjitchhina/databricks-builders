@@ -12,9 +12,8 @@ libc = "0.2"
 
 [features]
 huge = []
-
-[features]
 tools = ["dep:parquet"]
+hugealloc = []
 
 [[bin]]
 name = "pq2csv"
