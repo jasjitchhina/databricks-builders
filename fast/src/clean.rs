@@ -318,7 +318,7 @@ impl Lookups {
 }
 
 struct ParseState<K: IdKey> {
-    ev: crate::alloc::BlockRegions<ERec<K>, 4>,
+    ev: crate::alloc::BlockRegions<ERec<K>, 2>,
     side: Vec<(u32, u16)>,
     cl: WcRegions<CRec<K>, 8>,
     cbuf: Vec<CRec<K>>,
