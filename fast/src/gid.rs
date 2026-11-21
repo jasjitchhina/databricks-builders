@@ -159,8 +159,42 @@ const fn code_b36_table() -> [u8; 64] {
 static CODE_B36: [u8; 64] = code_b36_table();
 
 /// Same as `b36(&id[1..])` (after the prefix check) but from a compact key; never re-reads bytes.
-#[inline]
+/// Branch-light SWAR version (no tables, no per-digit loop); equal to `compact_b36_scalar` on every u64.
+#[inline(always)]
 pub fn compact_b36(k: u64, prefix: u8) -> Option<u64> {
+    const B: u64 = 0x0101_0101_0101_0101;
+    const H: u64 = 0x8080_8080_8080_8080;
+    let pc = compact_code(prefix) as u64;
+    // 9 body codes: c1 at bits 52..57 ... c8 at 10..15, c9 at 4..9 and bits 0..3 (must be 0: <= 8 digits)
+    let x = (k >> 10) & ((1u64 << 48) - 1); // c1..c8, c8 lowest
+    // spread 8 x 6-bit codes into 8 bytes: byte j = c(8-j)
+    let mut t = (x & 0xFF_FFFF) | ((x & 0xFFFF_FF00_0000) << 8);
+    t = (t & 0x0000_0FFF_0000_0FFF) | ((t & 0x00FF_F000_00FF_F000) << 4);
+    t = (t & 0x003F_003F_003F_003F) | ((t & 0x0FC0_0FC0_0FC0_0FC0) << 2);
+    let tz_bytes = t.trailing_zeros() / 8; // codes are contiguous then zero padding
+    let ok_shape = (k >> 58) == pc && pc != 0 && k & 0x3FF == 0 && t != 0;
+    let y = t.checked_shr(8 * tz_bytes).unwrap_or(0); // right-aligned: byte 0 = last digit
+    let len = 8 - tz_bytes; // number of body codes (valid when t != 0)
+    let low = if len >= 8 { u64::MAX } else { (1u64 << (8 * len)) - 1 };
+    // per byte (all < 64, so +127 never carries across bytes)
+    let nz = (y + 0x7F * B) & H; // code != 0
+    let ge11 = (y + (128 - 11) * B) & H;
+    let ge38 = (y + (128 - 38) * B) & H;
+    let invalid = (ge11 & !ge38) | (!nz & H & low); // 'A'-'Z', '_', or an interior zero code
+    let d = y - (nz >> 7) - (ge38 >> 7) * 27; // '0'-'9' code 1..10 -> 0..9, 'a'-'z' 38..63 -> 10..35
+    let p = (d & 0x00FF_00FF_00FF_00FF) + ((d >> 8) & 0x00FF_00FF_00FF_00FF) * 36;
+    let q = (p & 0x0000_FFFF_0000_FFFF) + ((p >> 16) & 0x0000_FFFF_0000_FFFF) * 1296;
+    let v = (q & 0xFFFF_FFFF) + (q >> 32) * 1_679_616;
+    let lead0 = len > 1 && (k >> 52) & 63 == 1;
+    if ok_shape & (invalid == 0) & !lead0 & (v <= MASK) {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Reference (per-digit loop) for `compact_b36`.
+pub fn compact_b36_scalar(k: u64, prefix: u8) -> Option<u64> {
     if (k >> 58) as u8 != compact_code(prefix) || compact_code(prefix) == 0 {
         return None;
     }
@@ -469,6 +503,37 @@ mod tests {
             }
         }
         rec(&full, &mut s, 3);
+    }
+
+    #[test]
+    fn compact_swar_equals_scalar() {
+        let mut r = Rng(11);
+        let mut some = 0;
+        for i in 0..20_000_000u64 {
+            let k = match i % 4 {
+                0 => r.next(),
+                // valid-looking: prefix 'e' + random codes, random length, padded
+                _ => {
+                    let len = (r.next() % 10) as u32;
+                    let mut k = (compact_code(b"eku"[(i % 3) as usize]) as u64) << 58;
+                    for j in 0..len {
+                        let c = match r.next() % 8 {
+                            0 => r.next() % 64,
+                            1..=3 => 1 + r.next() % 10,
+                            _ => 38 + r.next() % 26,
+                        };
+                        k |= c << (52 - 6 * j);
+                    }
+                    k
+                }
+            };
+            for &p in b"eku_0" {
+                let a = compact_b36(k, p);
+                assert_eq!(a, compact_b36_scalar(k, p), "k={k:#018x} p={}", p as char);
+                some += a.is_some() as u32;
+            }
+        }
+        assert!(some > 1_000_000);
     }
 
     /// Synthetic generator-like samples: values of ids for n drawn from 0..e (with repeats).
