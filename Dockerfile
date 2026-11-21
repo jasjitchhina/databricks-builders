@@ -14,6 +14,8 @@ COPY fast/vendor ./vendor
 # trained on s7/s11/adv sets). A stale profile only costs speed, never correctness.
 COPY fast/pgo ./pgo
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -Cprofile-use=/src/fast/pgo/fast.profdata"
+# byte-identical rebuilds: mimalloc (C) embeds __DATE__/__TIME__ in a log string; gcc takes them from here
+ENV SOURCE_DATE_EPOCH=1700000000
 RUN mkdir -p src/bin && echo 'fn main(){}' > src/main.rs && echo '' > src/lib.rs \
  && echo 'fn main(){}' > src/bin/prepdump.rs \
  && cargo build --release --locked --offline --bin fast && rm -rf src
