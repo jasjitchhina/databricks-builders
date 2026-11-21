@@ -293,6 +293,7 @@ pub struct WcRegions<T: Copy, const K: usize> {
     stage: Vec<Stage<T, K>>,
     nst: Vec<u8>,
     _vbuf: Vec<u8>,
+    _hbuf: Option<HugeBuf<u8>>,
     base: Vec<*mut T>,
     cap: usize,
     len: Vec<u32>,
@@ -304,18 +305,23 @@ unsafe impl<T: Copy + Sync, const K: usize> Sync for WcRegions<T, K> {}
 
 impl<T: Copy, const K: usize> WcRegions<T, K> {
     pub fn new(nreg: usize, cap: usize) -> Self {
+        Self::new_with(nreg, cap, false)
+    }
+    pub fn new_with(nreg: usize, cap: usize, huge: bool) -> Self {
         let sz = std::mem::size_of::<T>();
         assert!((K * sz) % 64 == 0 && std::mem::align_of::<T>() <= 64);
         let cap = (cap.max(K) + K - 1) / K * K;
         let stride = (cap * sz + 64 * 64 + 4095) & !4095; // room for the max skew
         let bytes = nreg * stride + 64 * 64 + 4096;
-        let mut vb = Vec::<u8>::with_capacity(bytes);
-        let p0 = ((vb.as_mut_ptr() as usize + 4095) & !4095) as *mut u8;
+        let (hb, mut vb) = if huge { (Some(HugeBuf::<u8>::zeroed(bytes)), Vec::new()) } else { (None, Vec::<u8>::with_capacity(bytes)) };
+        let p0 = match &hb { Some(h) => h.as_mut_ptr(), None => vb.as_mut_ptr() };
+        let p0 = ((p0 as usize + 4095) & !4095) as *mut u8;
         let base = (0..nreg).map(|r| unsafe { p0.add(r * stride + (r % 64) * 64) as *mut T }).collect();
         WcRegions {
             stage: vec![Stage(unsafe { std::mem::zeroed() }); nreg],
             nst: vec![0; nreg],
             _vbuf: vb,
+            _hbuf: hb,
             base,
             cap,
             len: vec![0; nreg],

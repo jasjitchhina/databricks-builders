@@ -137,6 +137,7 @@ const LS: usize = 256; // link shards (== ShardedMap shards)
 /// Union-find over all link lines; returns id -> name for every linked id
 /// whose name is not itself.
 fn build_links(dir: &Path, threads: usize) -> ShardedMap {
+    let mut t = timer();
     let files = csv::list_csv(&dir.join("links"));
     let maps: Vec<Option<Mmap>> = files.iter().map(|p| csv::map(p)).collect();
     let chunks = csv::chunks(&maps, 1 << 20);
@@ -164,6 +165,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             });
         },
     );
+    t(" L parse");
     assert!(per.iter().all(|p| p.n_ep < (1 << 27)));
     // endpoint -> gid, written by shard tasks
     let ep: Vec<Vec<AtomicU32>> = (0..threads)
@@ -201,12 +203,19 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
         *shard_keys[s].lock().unwrap() = keys;
     });
     let shard_keys: Vec<Vec<Key>> = shard_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    t(" L intern");
     let mut base = vec![0u32; LS + 1];
     for s in 0..LS {
         base[s + 1] = base[s] + shard_keys[s].len() as u32;
     }
     let m = base[LS] as usize;
     let gid = |x: u32| base[(x >> 24) as usize] + (x & 0xFF_FFFF);
+    let mut keys: Vec<Key> = Vec::with_capacity(m);
+    for sk in &shard_keys {
+        keys.extend_from_slice(sk);
+    }
+    // Union by key order: the root of every tree is its byte-wise smallest
+    // key, i.e. the person's name.
     let mut parent: Vec<u32> = (0..m as u32).collect();
     for e in &ep {
         for pair in e.chunks_exact(2) {
@@ -215,7 +224,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
             if ra != rb {
-                if ra < rb {
+                if key_cmp(keys[ra as usize], keys[rb as usize]) == std::cmp::Ordering::Less {
                     parent[rb as usize] = ra;
                 } else {
                     parent[ra as usize] = rb;
@@ -223,33 +232,32 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             }
         }
     }
-    let mut name: Vec<Key> = vec![0; m];
-    let mut roots: Vec<u32> = vec![0; m];
-    for s in 0..LS {
-        for (l, &k) in shard_keys[s].iter().enumerate() {
-            let i = base[s] as usize + l;
-            let r = find(&mut parent, i as u32);
-            roots[i] = r;
-            let cur = name[r as usize];
-            if cur == 0 || key_cmp(k, cur) == std::cmp::Ordering::Less {
-                name[r as usize] = k;
+    t(" L unionfind");
+    let parent = &parent;
+    let keys = &keys;
+    let lists: Vec<Mutex<Vec<(Key, Key)>>> = (0..LS).map(|_| Mutex::new(Vec::new())).collect();
+    par_items(threads, LS, |_| (), |_, s| {
+        let mut v = Vec::new();
+        for i in base[s] as usize..base[s + 1] as usize {
+            let mut r = i as u32;
+            while parent[r as usize] != r {
+                r = parent[r as usize];
+            }
+            if r as usize != i {
+                v.push((keys[i], keys[r as usize]));
             }
         }
-    }
-    let mut per_shard = vec![0usize; LS];
-    for s in 0..LS {
-        per_shard[s] = (0..shard_keys[s].len()).filter(|&l| name[roots[base[s] as usize + l] as usize] != shard_keys[s][l]).count();
-    }
-    let map = ShardedMap::new(per_shard.iter().copied().max().unwrap_or(0));
+        *lists[s].lock().unwrap() = v;
+    });
+    let lists: Vec<Vec<(Key, Key)>> = lists.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    t(" L names");
+    let map = ShardedMap::new(lists.iter().map(|v| v.len()).max().unwrap_or(0));
     par_items(threads, LS, |_| (), |_, s| {
-        let keys = &shard_keys[s];
-        for (l, &k) in keys.iter().enumerate() {
-            let nm = name[roots[base[s] as usize + l] as usize];
-            if nm != k {
-                unsafe { map.insert_shard(s, k, nm) };
-            }
+        for &(k, nm) in &lists[s] {
+            unsafe { map.insert_shard(s, k, nm) };
         }
     });
+    t(" L map");
     map
 }
 
@@ -327,6 +335,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     let ev_cap = ev_est * 5 / 4 / NB / threads + 64;
     let cl_cap = cl_bytes / 45 * 5 / 4 / NPART / threads + 64;
     let long_click = AtomicBool::new(false);
+    let huge = std::env::var_os("FAST_NO_THP").is_none();
     t("map+chunk");
 
     let cl_lo = base;
@@ -334,9 +343,9 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         threads,
         chunks.len(),
         |_| ParseState {
-            ev: WcRegions::new(NB, ev_cap),
+            ev: WcRegions::new_with(NB, ev_cap, huge),
             side: Vec::with_capacity(ev_cap * NB / 20),
-            cl: WcRegions::new(NPART, cl_cap),
+            cl: WcRegions::new_with(NPART, cl_cap, huge),
             cbuf: Vec::new(),
         },
         |st, i| {
@@ -396,7 +405,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     let deduped = par_items(
         threads,
         NB,
-        |_| (Vec::<u64>::new(), Vec::<(Key, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec, 4>::new(NPART, out_cap)),
+        |_| (Vec::<u64>::new(), Vec::<(Key, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec, 4>::new_with(NPART, out_cap, huge)),
         |(table, surv, losers, out), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
@@ -511,7 +520,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     let mut parts: Vec<Part> = parts_out.iter_mut().map(|m| m.get_mut().unwrap().take().unwrap()).collect();
     t("parts");
 
-    if long_click.load(Ordering::Relaxed) {
+    if long_click.load(Ordering::Relaxed) && std::env::var_os("FAST_DUMP_NO_RANK").is_none() {
         rank_click_ids(&mut parts);
         t("rank clicks");
     }
@@ -704,6 +713,13 @@ pub fn microbench(dir: &Path) {
     run("wc-fresh", &mut || {
         let mut side = Vec::new();
         let mut wc = crate::alloc::WcRegions::<ERec, 4>::new(NB, cap);
+        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { wc.push(bucket_of(&r), r) });
+        wc.finish();
+        (0..NB).map(|b| wc.len_of(b) as u64).sum()
+    });
+    run("wc-huge", &mut || {
+        let mut side = Vec::new();
+        let mut wc = crate::alloc::WcRegions::<ERec, 4>::new_with(NB, cap, true);
         csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { wc.push(bucket_of(&r), r) });
         wc.finish();
         (0..NB).map(|b| wc.len_of(b) as u64).sum()
