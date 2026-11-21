@@ -220,6 +220,49 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     parse_f3(b)
 }
 
+/// ingest_ts: rules.md guarantees it is always valid F1 (and the generator
+/// writes it only with write_utc), so a field of length 20 ending in 'Z' (the
+/// F1 shape; F2 is 25 long, F3 has no 'Z') with a year inside the days table
+/// is combined without digit / separator / calendar validation. Anything else
+/// takes the full validating parser.
+#[inline(always)]
+pub fn parse_ingest_in(m: &[u8], b: &[u8]) -> Option<i64> {
+    #[cfg(target_feature = "avx2")]
+    {
+        if b.len() == 20 && b[19] == b'Z' {
+            if let Some(v) = unsafe { f1_trusted(b.as_ptr()) } {
+                return Some(v);
+            }
+        }
+    }
+    parse_ts_in(m, b)
+}
+
+/// Value of a trusted F1 (shape already checked); None if the year is
+/// outside the days table (then the caller uses the validating parser).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn f1_trusted(p: *const u8) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let lo = _mm_loadu_si128(p as *const __m128i);
+    let hi = _mm_loadu_si128(p.add(4) as *const __m128i);
+    let dl = _mm_shuffle_epi8(lo, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, -1, -1, -1, -1, -1, -1));
+    let dh = _mm_shuffle_epi8(hi, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 13, 14, -1, -1));
+    let d = _mm_subs_epu8(_mm_or_si128(dl, dh), _mm_set1_epi8(b'0' as i8));
+    let v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let f = _mm_madd_epi16(v, _mm_setr_epi16(100, 1, 32, 1, 3600, 60, 1, 0));
+    let y = _mm_cvtsi128_si32(f) as i64;
+    if !(YMIN..YMIN + YN as i64).contains(&y) {
+        return None;
+    }
+    let md = _mm_extract_epi32(f, 1) as usize;
+    let sod = (_mm_extract_epi32(f, 2) + _mm_extract_epi32(f, 3)) as i64;
+    let (mo, dd) = (md >> 5, (md & 31) as i64);
+    let i = ((y - YMIN) as usize * 12 + mo).wrapping_sub(1).min(YN * 12 - 1);
+    let t = &*TABLES;
+    Some((t.days[i] as i64 + dd - 1) * 86_400_000 + sod * 1000)
+}
+
 /// `parse_ts` for a field inside mapping `m`: the F3 form uses a SIMD digit
 /// parser that reads the 16 bytes ending at the field's end when they lie in `m`.
 #[inline(always)]
@@ -387,6 +430,12 @@ mod fuzz {
             padded.extend_from_slice(&v);
             padded.extend_from_slice(b",x");
             assert_eq!(parse_ts_in(&padded, &padded[20..20 + v.len()]), ref_ts(&v), "in {:?}", String::from_utf8_lossy(&v));
+            // the trusted ingest parser must agree on every VALID input
+            if let Some(want) = ref_ts(&v) {
+                if want != i64::MAX {
+                    assert_eq!(parse_ingest_in(&padded, &padded[20..20 + v.len()]), Some(want), "ingest {:?}", String::from_utf8_lossy(&v));
+                }
+            }
         }
     }
 }

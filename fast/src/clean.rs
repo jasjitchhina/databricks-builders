@@ -5,7 +5,7 @@ use crate::csv::{self, pack_in, Chunk};
 use crate::ids::{key_cmp, pack, Key, KeyMap, NPART};
 use crate::keys::{part_of, part_of_h, GMap, GSharded, IdKey};
 use crate::model::{Cl, Cleaned, Ev, Part, Rows};
-use crate::ts::{parse_ts, parse_ts_in, DAY_MS};
+use crate::ts::{parse_ingest_in, parse_ts, parse_ts_in, DAY_MS};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::path::Path;
@@ -304,6 +304,7 @@ struct Lookups {
     products: KeyMap, // product key -> cat idx
     unknown_cat: u16,
     campaigns: KeyMap, // campaign key -> idx
+    strict_ingest: bool,
 }
 
 impl Lookups {
@@ -414,7 +415,7 @@ fn read_small(dir: &Path) -> Small {
     for (i, c) in camp_ids.iter().enumerate() {
         campaigns.insert(pack(c), i as Key);
     }
-    let lk = Lookups { products, unknown_cat, campaigns };
+    let lk = Lookups { products, unknown_cat, campaigns, strict_ingest: std::env::var_os("FAST_STRICT_INGEST").is_some() };
     Small { ws, we, base, lk, cat_names, camp_ids, camp_channels }
 }
 
@@ -890,7 +891,9 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
     if eid.is_empty() {
         return Ok(None);
     }
-    let ingest = parse_ts_in(m, ing).unwrap_or(i64::MAX);
+    // rules.md: ingest_ts is always valid F1 (trusted fast path, guarded by shape;
+    // FAST_STRICT_INGEST=1 validates it like ts)
+    let ingest = if lk.strict_ingest { parse_ts_in(m, ing) } else { parse_ingest_in(m, ing) }.unwrap_or(i64::MAX);
     let Some(ek) = K::pack(m, eid) else { return Err(()) };
     let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0 };
     'v: {
@@ -938,7 +941,7 @@ pub fn microbench(dir: &Path) {
             products.insert(pack(p), 1);
         }
     });
-    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16) };
+    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16), strict_ingest: false };
     let mut data: Vec<u8> = Vec::new();
     for f in csv::list_csv(&dir.join("events")) {
         let b = std::fs::read(f).unwrap();
