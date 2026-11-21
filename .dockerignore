@@ -3,7 +3,9 @@ dev/
 out/
 *.md
 .git
-**/target/
+fast/target/
+fast-tools/
+generator/target/
 *.zip
 generator/
 dev-answer/

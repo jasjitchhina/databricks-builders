@@ -1,7 +1,7 @@
 #!/bin/bash
 # oraclecheck.sh SET...  : diff outputs + sessions.csv dump vs ~/data/oracle/<SET>
 here=$(cd "$(dirname "$0")" && pwd)
-BIN=${BIN:-$here/target/release/fast}; PQ=$here/target/release/pq2csv
+BIN=${BIN:-$here/target/release/fast}; PQ=${PQ:-$here/../fast-tools/target/release/pq2csv}
 UC=user_id,day,sessions,events,revenue_cents,top_category
 CC=campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions
 rc=0

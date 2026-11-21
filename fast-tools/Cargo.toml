@@ -1,0 +1,14 @@
+[package]
+name = "fast-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Dev-only helpers (parquet -> csv for stage diffs). Kept OUT of fast/ so the runtime crate's
+# lockfile has only the 9 crates the scorer build needs, which are vendored in fast/vendor.
+
+[dependencies]
+parquet = { version = "60", default-features = false, features = ["snap", "zstd"] }
+
+[[bin]]
+name = "pq2csv"
+path = "src/bin/pq2csv.rs"

@@ -15,3 +15,6 @@ team.db*
 !dev-answer/*.csv
 fast/target/
 __pycache__/
+
+# vendored crates must be committed whole (cargo checksums every file)
+!fast/vendor/**
