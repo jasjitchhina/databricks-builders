@@ -58,7 +58,9 @@ def q(v):
     return f'"{v}"' if R.random() < 0.2 else v
 
 
-def line(fields):
+def line(fields, exact=False):
+    """exact=True: this line is a copy that rules.md guarantees identical in value, so only
+    value-preserving changes (quoting) or whole-line malformation (dropped) are allowed."""
     s = ",".join(q(f) for f in fields)
     r = R.random()
     if r < 0.01:
@@ -67,7 +69,7 @@ def line(fields):
         return s + ",x"
     if r < 0.03:
         return s.replace(",", ",\"", 1)
-    if r < 0.04:
+    if r < 0.04 and not exact:
         return s + "\r"
     if r < 0.045:
         return ",".join(fields[:-1])
@@ -108,7 +110,10 @@ for _ in range(R.randint(20, 250)):
     pid = R.choice(prods + ["p9", "P1", "", " p1"])
     tsv = iso(t) if R.random() > 0.08 else bad_ts(t)
     fields = [f"e{eid}", u, tsv, iso(ing, "F1") if ing % 1000 == 0 else iso(ing - ing % 1000, "F1"), typ, pid, price]
-    ev.append(line(fields))
+    if R.random() < 0.04:
+        fields[6] += "\r"  # \r baked into the value, so identical copies carry it too
+    ev.append(line(fields, exact=True))
+    by_ing = {fields[3]: fields}
     for _ in range(R.choice([0, 0, 0, 1, 2])):  # duplicates
         f2 = list(fields)
         later = ing - ing % 1000 + R.choice([0, 1000, 600_000, -1000])
@@ -117,9 +122,10 @@ for _ in range(R.randint(20, 250)):
             f2[1] = R.choice(users)
         if R.random() < 0.3:
             f2[2] = iso(t) if R.random() < 0.5 else bad_ts(t)
-        if later == ing - ing % 1000:
-            f2 = list(fields)  # equal ingest -> identical copy (rules guarantee)
-        ev.append(line(f2))
+        if f2[3] in by_ing:
+            f2 = list(by_ing[f2[3]])  # equal ingest -> identical copy (rules guarantee)
+        by_ing[f2[3]] = f2
+        ev.append(line(f2, exact=True))
 split("events", "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents", ev)
 
 cl = []
@@ -128,9 +134,11 @@ for i in range(R.randint(0, 80)):
     base = R.choice(anchors) + R.choice([0, -1, 1, -7 * DAY, -7 * DAY - 1, -R.randint(0, 7 * DAY), -3600_000])
     fields = [f"k{i}", u, R.choice(camps + ["c_9", "C_1", ""]),
               iso(base) if R.random() > 0.08 else bad_ts(base)]
-    cl.append(line(fields))
+    if R.random() < 0.04:
+        fields[3] += "\r"
+    cl.append(line(fields, exact=True))
     if R.random() < 0.05:
-        cl.append(line(fields))
+        cl.append(line(fields, exact=True))
     if R.random() < 0.1:  # same-ms tie with another click id
         cl.append(line([f"j{i}", u, R.choice(camps), fields[3]]))
 split("clicks", "click_id,user_id,campaign_id,ts", cl)
