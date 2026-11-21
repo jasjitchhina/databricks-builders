@@ -355,10 +355,12 @@ pub fn scan_fast<'a, const N: usize, F: FnMut([&'a [u8]; N])>(buf: &'a [u8], sta
             return;
         }
         let p = unsafe { buf.as_ptr().add(ls) };
-        let (s0, n0, q0) = unsafe { masks64(p) };
-        let (s1, n1, q1) = unsafe { masks64(p.add(64)) };
-        let nl = n0 as u128 | (n1 as u128) << 64;
         let rem = end - ls;
+        let (s0, n0, q0) = unsafe { masks64(p) };
+        // second block only if the line does not end in the first one
+        let v0 = if rem >= 64 { u64::MAX } else { (1u64 << rem) - 1 };
+        let (s1, n1, q1) = if n0 & v0 != 0 { (0, 0, 0) } else { unsafe { masks64(p.add(64)) } };
+        let nl = n0 as u128 | (n1 as u128) << 64;
         let valid = if rem >= 128 { u128::MAX } else { (1u128 << rem) - 1 };
         let nlv = nl & valid;
         let len = if nlv != 0 {
