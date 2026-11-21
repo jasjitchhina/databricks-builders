@@ -9,6 +9,20 @@ pub fn prepare_dirs(out_dir: &Path) -> (PathBuf, PathBuf) {
     let cd = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
+    // The scorer gives an empty /output, but never let a stale table file from an
+    // earlier run add rows: remove every regular *.parquet a reader would pick up.
+    for d in [&ud, &cd] {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+                if is_file && n.ends_with(".parquet") && !n.starts_with('.') && !n.starts_with('_') {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
     (ud, cd)
 }
 
