@@ -7,15 +7,16 @@ fn main() {
     let out = PathBuf::from(args.get(2).cloned().or_else(|| std::env::var("OUTPUT_DIR").ok()).unwrap_or("/output".into()));
     let nthreads: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
-    rayon::ThreadPoolBuilder::new().num_threads(nthreads).build_global().ok();
+    fast::set_threads(nthreads);
     let dump = std::env::var("DUMP_DIR").ok().map(PathBuf::from);
     let verbose = std::env::var("FAST_TIMING").is_ok();
     let t0 = Instant::now();
     let c = if std::env::var("FAST_TEMP_LOADER").is_ok() { fast::loader::load(&data) } else { fast::clean::clean(&data, nthreads) };
     let t1 = Instant::now();
-    let o = fast::engine::run(&c, dump.is_some());
+    let (ud, cd) = fast::writer::prepare_dirs(&out);
+    let o = fast::engine::run(&c, dump.is_some(), Some(&ud));
     let t2 = Instant::now();
-    fast::writer::write(&out, &c, &o);
+    fast::writer::write_campaigns(&cd, &c, &o);
     let t3 = Instant::now();
     if let (Some(d), Some(sd)) = (dump, o.session_dump.as_ref()) {
         std::fs::create_dir_all(&d).unwrap();
