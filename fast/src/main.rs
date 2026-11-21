@@ -69,6 +69,9 @@ fn main() {
         let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         eprintln!("end_epoch_ns {ns}");
     }
+    if std::env::var_os("FAST_NO_ZAP").is_none() {
+        zap_input_mappings(&data, nthreads);
+    }
     // Skip destructors: freeing millions of small allocations at exit is pure waste.
     std::process::exit(0);
 }
@@ -108,4 +111,47 @@ fn prefetch_inputs(data: &std::path::Path) {
             }
         });
     }
+}
+
+/// After all outputs are written: drop the page-table entries of the (leaked) CSV
+/// mappings with MADV_DONTNEED from several threads in parallel (it runs under the
+/// mmap read lock, unlike munmap), so the single-threaded exit teardown has nothing
+/// left to walk. Only read-only file mappings under the data dir are touched; a stray
+/// later access would just re-fault the same bytes from the page cache.
+fn zap_input_mappings(data: &std::path::Path, nthreads: usize) {
+    let Ok(root) = std::fs::canonicalize(data) else { return };
+    let root = root.to_string_lossy().into_owned();
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
+    let mut ranges: Vec<(usize, usize)> = vec![];
+    for line in maps.lines() {
+        // addr perms offset dev inode path
+        let mut it = line.split_whitespace();
+        let (Some(addr), Some(perms)) = (it.next(), it.next()) else { continue };
+        let path = it.nth(3).unwrap_or("");
+        if !perms.starts_with("r--") || !path.starts_with(root.as_str()) {
+            continue;
+        }
+        let Some((a, b)) = addr.split_once('-') else { continue };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+        // split into 64MB pieces for balance
+        let mut x = a;
+        while x < b {
+            let l = (64usize << 20).min(b - x);
+            ranges.push((x, l));
+            x += l;
+        }
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..nthreads.clamp(1, 16) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&(a, l)) = ranges.get(i) else { break };
+                unsafe { libc::madvise(a as *mut libc::c_void, l, libc::MADV_DONTNEED) };
+            });
+        }
+    });
 }
