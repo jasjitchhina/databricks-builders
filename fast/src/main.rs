@@ -34,5 +34,14 @@ fn main() {
             "load {:?} engine {:?} write {:?} | events {} clicks {} persons {}",
             t1 - t0, t2 - t1, t3 - t2, c.parts.iter().map(|p| p.ev.len()).sum::<usize>(), c.parts.iter().map(|p| p.cl.len()).sum::<usize>(), c.parts.iter().map(|p| p.person_names.len()).sum::<usize>()
         );
+        if std::env::var("FAST_MEASURE_DROP").is_ok() {
+            let t = Instant::now();
+            drop(o);
+            drop(c);
+            eprintln!("drop {:?}", t.elapsed());
+            return;
+        }
     }
+    // Skip destructors: freeing millions of small allocations at exit is pure waste.
+    std::process::exit(0);
 }
