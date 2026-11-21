@@ -16,5 +16,6 @@ gen 11 60000000 15000000 s11-60m
 [ -d "$D/adv-synth-s2" ] || python3 "$H/adv_synth.py" "$D/adv-synth-s2" 2
 [ -d "$D/adv-synth-s3" ] || python3 "$H/adv_synth.py" "$D/adv-synth-s3" 3
 [ -d "$D/adv-synth-s4" ] || CHAIN=400 STAR=400 python3 "$H/adv_synth.py" "$D/adv-synth-s4" 4   # short chains: xcheck-friendly
+[ -d "$D/adv-shape-onefile" ] || python3 "$H/adv_shapes.py" "$D/s4-1m" "$D/adv-shape"   # + adv-shape-hugeline: see notes (onefile + 100MB/5M-comma/40MB-quoted lines)
 for d in "$D"/adv-*; do python3 "$H/check_invariants.py" "$d"; done
-"$H/oracle_cache.sh" s2-1m s3-1m s15-1m-feb29 s62-1m-feb29 adv-perturb-s21 adv-synth-s2 adv-synth-s3 adv-synth-s4
+"$H/oracle_cache.sh" s2-1m s3-1m s15-1m-feb29 s62-1m-feb29 adv-perturb-s21 adv-synth-s2 adv-synth-s3 adv-synth-s4 adv-shape-onefile adv-shape-manyfiles adv-shape-longids adv-shape-sparse

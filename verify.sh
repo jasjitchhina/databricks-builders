@@ -9,7 +9,7 @@
 #   1. all fixtures/                      (expected CSVs, scripts/run_fixtures.py)
 #   2. check-dev                          (~/data/dev vs dev-answer/)
 #   3. row-exact diff vs the oracle cache (~/data/oracle/<ds>/out/, h1's layout) on $VERIFY_SETS
-#      default: s2-1m s3-1m s15-1m-feb29 + every ~/data/adv-* + s7-20m (20M)
+#      default: s2-1m s3-1m s15-1m-feb29 + every ~/data/adv-* + s7-20m (20M) + s8-20m/s11-60m once their oracle DONE exists
 # Env: QUICK=1 skips the 20M set. VERIFY_SETS="a b" overrides the oracle sets.
 #      ALLOW_MISSING_ORACLE=1 skips (instead of failing) sets with no oracle answer yet.
 # Builds and runs take the SHARED /tmp/bench.lock. Oracle answers are made by harness/oracle_cache.sh.
@@ -27,12 +27,12 @@ if [ "$TARGET" = "-r" ]; then
   git -C "$ROOT" archive "$COMMIT" | tar -x -C "$CTX"
   TARGET="verify-rev-$COMMIT:latest"
   echo "== building $TARGET from $REV ($COMMIT)" >&2
-  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
   rm -rf "$CTX"
 elif [ -z "$TARGET" ]; then
   TARGET="verify-$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.\n-' '-'):latest"
   echo "== building $TARGET" >&2
-  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
 elif [ -f "$TARGET" ]; then
   TARGET=$(cd "$(dirname "$TARGET")" && pwd)/$(basename "$TARGET")
 fi
@@ -70,6 +70,12 @@ check() {  # check NAME DATA ANSWER
   else
     echo "FAIL $name"; cat "$WORK/cmp-$name.txt"; FAILS+=("$name")
   fi
+  if [ "$name" = dev ] || [ "$name" = adv-synth-s2 ]; then  # independent Parquet readers (pyarrow full validate + DuckDB)
+    docker image inspect harness-py:latest >/dev/null 2>&1 || flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 -t harness-py:latest "$ROOT/harness/pyimg" >/dev/null
+    if docker run --rm --network none --cpuset-cpus 8-15 -v "$out":/o:ro -v "$ROOT/harness":/h:ro harness-py:latest python3 /h/pqcheck.py /o > "$WORK/pq-$name.txt" 2>&1; then
+      echo "ok   $name parquet readers (pyarrow+duckdb)"
+    else echo "FAIL $name parquet readers"; cat "$WORK/pq-$name.txt"; FAILS+=("$name:parquet"); fi
+  fi
   rm -rf "$out" 2>/dev/null
 }
 
@@ -81,7 +87,11 @@ if [ -n "${VERIFY_SETS:-}" ]; then
 else
   SETS=(s2-1m s3-1m s15-1m-feb29)
   for d in "$DATA_ROOT"/adv-*; do [ -d "$d" ] && SETS+=("$(basename "$d")"); done
-  [ "${QUICK:-0}" = 1 ] || SETS+=(s7-20m)
+  if [ "${QUICK:-0}" != 1 ]; then
+    SETS+=(s7-20m)
+    # extra big sets join automatically once their oracle answer exists
+    for x in s8-20m s11-60m; do [ -f "$DATA_ROOT/oracle/$x/DONE" ] && SETS+=("$x"); done
+  fi
 fi
 echo "== [3] oracle diffs: ${SETS[*]}"
 for ds in "${SETS[@]}"; do
