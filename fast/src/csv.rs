@@ -333,3 +333,115 @@ mod scan_tests {
         }
     }
 }
+
+/// Line-local scanner, same contract as `scan`: for each line, loads the 128
+/// bytes at its start, takes the newline and exactly N-1 commas from the masks
+/// (fixed trip count), and unquotes branch-free (a field is wrapped iff it is
+/// at least 2 long and starts and ends with '"'; the line is valid iff the
+/// wrapped fields account for every quote). Lines of 128+ bytes and the
+/// last 128 bytes of the mapping take the slow path.
+#[inline(always)]
+pub fn scan_fast<'a, const N: usize, F: FnMut([&'a [u8]; N])>(buf: &'a [u8], start: usize, end: usize, mut f: F) {
+    let mut ls = start;
+    let lim = buf.len().saturating_sub(128);
+    while ls < end {
+        if ls > lim {
+            scan::<N, F>(buf, ls, end, f);
+            return;
+        }
+        let p = unsafe { buf.as_ptr().add(ls) };
+        let (s0, n0, q0) = unsafe { masks64(p) };
+        let (s1, n1, q1) = unsafe { masks64(p.add(64)) };
+        let nl = n0 as u128 | (n1 as u128) << 64;
+        let rem = end - ls;
+        let valid = if rem >= 128 { u128::MAX } else { (1u128 << rem) - 1 };
+        let nlv = nl & valid;
+        let len = if nlv != 0 {
+            nlv.trailing_zeros() as usize
+        } else if rem < 128 {
+            rem // last line of the file without '\n'
+        } else {
+            // a line of 128+ bytes
+            let le = match memchr::memchr(b'\n', &buf[ls..end]) {
+                Some(x) => ls + x,
+                None => end,
+            };
+            if let Some(fl) = split::<N>(&buf[ls..le]) {
+                f(fl);
+            }
+            ls = le + 1;
+            continue;
+        };
+        let below = if len >= 128 { u128::MAX } else { (1u128 << len) - 1 };
+        let sep = s0 as u128 | (s1 as u128) << 64;
+        let mut commas = sep & !nl & below;
+        let next = ls + len + 1;
+        if commas.count_ones() as usize == N - 1 {
+            let q = (q0 as u128 | (q1 as u128) << 64) & below;
+            let mut fl: [&'a [u8]; N] = [&[]; N];
+            let mut s = ls;
+            let mut wsum = 0u32;
+            for k in 0..N {
+                let e = if k < N - 1 {
+                    let c = commas.trailing_zeros() as usize;
+                    commas &= commas - 1;
+                    ls + c
+                } else {
+                    ls + len
+                };
+                let n = e - s;
+                let first = unsafe { *buf.get_unchecked(s) };
+                let last = unsafe { *buf.get_unchecked(if n > 0 { e - 1 } else { s }) };
+                let w = ((n >= 2) & (first == b'"') & (last == b'"')) as usize;
+                fl[k] = unsafe { buf.get_unchecked(s + w..e - w) };
+                wsum += 2 * w as u32;
+                s = e + 1;
+            }
+            if wsum == q.count_ones() {
+                f(fl);
+            }
+        }
+        ls = next;
+    }
+}
+
+#[cfg(test)]
+mod scan_fast_tests {
+    use super::*;
+    fn collect<const N: usize>(b: &[u8], start: usize, end: usize) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        scan_fast::<N, _>(b, start, end, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        v
+    }
+    fn slow<const N: usize>(b: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        for_lines(b, |l| if let Some(f) = split::<N>(l) { v.push(f.iter().map(|x| x.to_vec()).collect()) });
+        v
+    }
+    #[test]
+    fn matches_split() {
+        let mut seed = 777u64;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+        for round in 0..3000 {
+            // lines of random length 0..300 from a small alphabet, joined by \n
+            let alpha: &[u8] = if round % 3 == 0 { b"ab,\"\n\r " } else { b"abcdefgh,,\"" };
+            let mut b = Vec::new();
+            let nlines = rnd() % 40;
+            for _ in 0..nlines {
+                let l = match rnd() % 4 { 0 => rnd() % 8, 1 => rnd() % 300, _ => 20 + rnd() % 100 };
+                for _ in 0..l { b.push(alpha[rnd() % alpha.len()]); }
+                b.push(b'\n');
+            }
+            if rnd() % 2 == 0 { for _ in 0..rnd() % 50 { b.push(alpha[rnd() % alpha.len()]); } }
+            // the chunk is the whole buffer; also test with trailing slack (chunk end < buffer end)
+            assert_eq!(collect::<2>(&b, 0, b.len()), slow::<2>(&b));
+            assert_eq!(collect::<4>(&b, 0, b.len()), slow::<4>(&b));
+            assert_eq!(collect::<7>(&b, 0, b.len()), slow::<7>(&b));
+            if let Some(cut) = b.iter().rposition(|&c| c == b'\n') {
+                let mut big = b.clone();
+                big.extend_from_slice(&[b'x'; 300]);
+                assert_eq!(collect::<7>(&big, 0, cut + 1), slow::<7>(&b[..cut + 1]));
+            }
+        }
+    }
+}

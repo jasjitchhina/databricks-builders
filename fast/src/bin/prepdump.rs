@@ -15,6 +15,9 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let threads: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let t0 = std::time::Instant::now();
+    if a.len() >= 3 {
+        std::env::set_var("FAST_DUMP_NO_RANK", "1"); // keep raw click_id keys so they can be printed
+    }
     let c = clean(std::path::Path::new(&a[1]), threads);
     eprintln!("clean: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
     let ne: usize = c.parts.iter().map(|p| p.ev.len()).sum();
