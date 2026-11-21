@@ -15,5 +15,6 @@ gen 11 60000000 15000000 s11-60m
 [ -d "$D/adv-perturb-s21" ] || { gen 21 1000000 250000 scratch/src-s21; python3 "$H/adv_perturb.py" "$D/scratch/src-s21" "$D/adv-perturb-s21" 21; }
 [ -d "$D/adv-synth-s2" ] || python3 "$H/adv_synth.py" "$D/adv-synth-s2" 2
 [ -d "$D/adv-synth-s3" ] || python3 "$H/adv_synth.py" "$D/adv-synth-s3" 3
+[ -d "$D/adv-synth-s4" ] || CHAIN=400 STAR=400 python3 "$H/adv_synth.py" "$D/adv-synth-s4" 4   # short chains: xcheck-friendly
 for d in "$D"/adv-*; do python3 "$H/check_invariants.py" "$d"; done
-"$H/oracle_cache.sh" s2-1m s3-1m s15-1m-feb29 s62-1m-feb29 adv-perturb-s21 adv-synth-s2 adv-synth-s3
+"$H/oracle_cache.sh" s2-1m s3-1m s15-1m-feb29 s62-1m-feb29 adv-perturb-s21 adv-synth-s2 adv-synth-s3 adv-synth-s4
