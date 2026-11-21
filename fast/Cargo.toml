@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rayon = "1"
 rustc-hash = "2"
-parquet = { version = "60", default-features = false, features = ["snap", "zstd"] }
+parquet = { version = "60", default-features = false, features = ["snap", "zstd"], optional = true }
 memmap2 = "0.9"
 memchr = "2"
+
+[features]
+tools = ["dep:parquet"]
+
+[[bin]]
+name = "pq2csv"
+required-features = ["tools"]
 
 [profile.release]
 opt-level = 3

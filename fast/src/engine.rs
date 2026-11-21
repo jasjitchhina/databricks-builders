@@ -2,17 +2,12 @@
 //! aggregate into user_daily / campaign_daily rows.
 use crate::model::*;
 use crate::{DAY_MS, GAP_MS, WEEK_MS};
-use rayon::prelude::*;
-
-pub struct UserRow {
-    pub part: u32,
-    pub person: u32,
-    pub day: i32,
-    pub sessions: u32,
-    pub events: u32,
-    pub revenue: u64,
-    pub top_cat: Option<u16>,
-}
+use crate::pq;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+pub static T_GROUP: AtomicU64 = AtomicU64::new(0);
+pub static T_SORT: AtomicU64 = AtomicU64::new(0);
+pub static T_PROC: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Default)]
 pub struct CampAcc {
@@ -25,9 +20,9 @@ pub struct CampAcc {
 pub struct Output {
     pub day0: i32,
     pub ndays: usize,
-    pub user_rows: Vec<Vec<UserRow>>,
     /// [(ncamp+1) * ndays], last campaign index = organic
     pub camp: Vec<CampAcc>,
+    pub user_rows: usize,
     pub session_dump: Option<Vec<Vec<u8>>>,
 }
 
@@ -40,9 +35,9 @@ struct Scratch {
     sess_cat: Vec<u64>,
     sess_touched: Vec<u16>,
     camp: Vec<CampAcc>,
-    rows: Vec<UserRow>,
+    ucols: Vec<pq::ColBuf>,
+    urows: usize,
     dump: Vec<u8>,
-    cur_person: u32,
     eoff: Vec<u32>,
     coff: Vec<u32>,
     evs: Vec<Ev>,
@@ -74,7 +69,9 @@ fn group<T: Copy>(items: &[T], np: usize, key: impl Fn(&T) -> u32, off: &mut Vec
     }
 }
 
-pub fn run(c: &Cleaned, dump: bool) -> Output {
+/// Runs the back half. If `user_dir` is given, each worker writes its user_daily rows
+/// to `user_dir/part-<w>.parquet`.
+pub fn run(c: &Cleaned, dump: bool, user_dir: Option<&Path>) -> Output {
     let ncamp = c.camp_ids.len();
     let ncat = c.cat_names.len();
     let organic = ncamp as u16;
@@ -117,9 +114,9 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
         sess_cat: vec![0; ncat],
         sess_touched: vec![],
         camp: vec![CampAcc::default(); (ncamp + 1) * ndays],
-        rows: vec![],
+        ucols: pq::user_cols(),
+        urows: 0,
         dump: vec![],
-        cur_person: 0,
         eoff: vec![],
         coff: vec![],
         evs: vec![],
@@ -130,50 +127,70 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
     let mut order: Vec<usize> = (0..c.parts.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(c.parts[i].ev.len() + c.parts[i].cl.len()));
 
-    let results: Vec<(Vec<Vec<UserRow>>, Vec<CampAcc>, Vec<u8>)> = order
-        .par_iter()
-        .fold(
-            || (vec![], None::<Scratch>),
-            |(mut out, mut sc), &pi| {
-                let s = sc.get_or_insert_with(new_scratch);
-                let part = &c.parts[pi];
-                let np = part.person_names.len();
-                group(&part.ev, np, |e| e.person, &mut s.eoff, &mut s.evs);
-                group(&part.cl, np, |e| e.person, &mut s.coff, &mut s.cls);
-                let mut evs = std::mem::take(&mut s.evs);
-                let mut cls = std::mem::take(&mut s.cls);
-                let eoff = std::mem::take(&mut s.eoff);
-                let coff = std::mem::take(&mut s.coff);
-                for p in 0..np {
-                    let (ea, eb) = (eoff[p] as usize, eoff[p + 1] as usize);
-                    if ea == eb {
-                        continue;
-                    }
-                    let pe = &mut evs[ea..eb];
-                    let (ca, cb) = (coff[p] as usize, coff[p + 1] as usize);
-                    let pc = &mut cls[ca..cb];
-                    pe.sort_unstable_by_key(|e| e.ts);
-                    pc.sort_unstable_by_key(|x| (x.ts, x.click_id));
-                    s.cur_person = p as u32;
-                    process_person(&part.person_names[p], pe, pc, s, organic, ndays, day0, &day_of, &pick_top, dump, c);
+    let nthreads = crate::threads();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let worker = |w: usize| {
+        let mut sc = new_scratch();
+        let s = &mut sc;
+        loop {
+            let oi = next.fetch_add(1, Relaxed);
+            if oi >= order.len() {
+                break;
+            }
+            let pi = order[oi];
+            let part = &c.parts[pi];
+            let np = part.person_names.len();
+            let t0 = std::time::Instant::now();
+            group(&part.ev, np, |e| e.person, &mut s.eoff, &mut s.evs);
+            group(&part.cl, np, |e| e.person, &mut s.coff, &mut s.cls);
+            let mut evs = std::mem::take(&mut s.evs);
+            let mut cls = std::mem::take(&mut s.cls);
+            let eoff = std::mem::take(&mut s.eoff);
+            let coff = std::mem::take(&mut s.coff);
+            let t1 = std::time::Instant::now();
+            T_GROUP.fetch_add((t1 - t0).as_nanos() as u64, Relaxed);
+            for p in 0..np {
+                let (ea, eb) = (eoff[p] as usize, eoff[p + 1] as usize);
+                let (ca, cb) = (coff[p] as usize, coff[p + 1] as usize);
+                evs[ea..eb].sort_unstable_by_key(|e| e.ts);
+                cls[ca..cb].sort_unstable_by_key(|x| (x.ts, x.click_id));
+            }
+            let t2 = std::time::Instant::now();
+            T_SORT.fetch_add((t2 - t1).as_nanos() as u64, Relaxed);
+            for p in 0..np {
+                let (ea, eb) = (eoff[p] as usize, eoff[p + 1] as usize);
+                if ea == eb {
+                    continue;
                 }
-                s.evs = evs;
-                s.cls = cls;
-                s.eoff = eoff;
-                s.coff = coff;
-                // tag rows with part so writer can find names
-                out.push(std::mem::take(&mut s.rows).into_iter().map(|mut r| { r.part = pi as u32; r }).collect());
-                (out, sc)
-            },
-        )
-        .map(|(rows, sc)| {
-            let mut sc = sc.unwrap_or_else(new_scratch);
-            (rows, std::mem::take(&mut sc.camp), std::mem::take(&mut sc.dump))
-        })
-        .collect();
+                let pe = &mut evs[ea..eb];
+                let (ca, cb) = (coff[p] as usize, coff[p + 1] as usize);
+                let pc = &mut cls[ca..cb];
+                process_person(&part.person_names[p], pe, pc, s, organic, ndays, day0, &day_of, &pick_top, dump, c);
+            }
+            T_PROC.fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
+            s.evs = evs;
+            s.cls = cls;
+            s.eoff = eoff;
+            s.coff = coff;
+        }
+        if let Some(dir) = user_dir {
+            if sc.urows > 0 || w == 0 {
+                let bytes = pq::encode(&sc.ucols, sc.urows);
+                std::fs::write(dir.join(format!("part-{w}.parquet")), bytes).expect("write user_daily");
+            }
+        }
+        (sc.urows, std::mem::take(&mut sc.camp), std::mem::take(&mut sc.dump))
+    };
+    let results: Vec<(usize, Vec<CampAcc>, Vec<u8>)> =
+        std::thread::scope(|scope| {
+            let worker = &worker;
+            let hs: Vec<_> = (0..nthreads).map(|w| scope.spawn(move || worker(w))).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
+    let tm = std::time::Instant::now();
     let mut camp = vec![CampAcc::default(); (ncamp + 1) * ndays];
-    let mut user_rows = vec![];
+    let mut user_rows = 0;
     let mut dumps = vec![];
     for (rows, cacc, d) in results {
         for (x, y) in camp.iter_mut().zip(cacc.iter()) {
@@ -182,10 +199,13 @@ pub fn run(c: &Cleaned, dump: bool) -> Output {
             x.revenue += y.revenue;
             x.assisted += y.assisted;
         }
-        user_rows.extend(rows);
+        user_rows += rows;
         dumps.push(d);
     }
-    Output { day0, ndays, user_rows, camp, session_dump: if dump { Some(dumps) } else { None } }
+    if std::env::var("FAST_TIMING").is_ok() {
+        eprintln!("engine: sort {}ms group {}ms proc+sort {}ms (thread-summed) merge {:?} nresults {}", T_SORT.load(Relaxed)/1000000, T_GROUP.load(Relaxed)/1000000, T_PROC.load(Relaxed)/1000000, tm.elapsed(), dumps.len());
+    }
+    Output { day0, ndays, camp, user_rows, session_dump: if dump { Some(dumps) } else { None } }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,7 +238,7 @@ fn process_person(
         // user-day aggregation: flush previous day before accumulating this session
         if day != cur_day {
             if cur_day != i32::MIN {
-                flush_day(cur_day, d_sess, d_ev, d_rev, s, pick_top);
+                flush_day(name, cur_day, d_sess, d_ev, d_rev, s, pick_top, c);
             }
             cur_day = day;
             d_sess = 0;
@@ -329,7 +349,7 @@ fn process_person(
         d_rev += rev;
     }
     if cur_day != i32::MIN {
-        flush_day(cur_day, d_sess, d_ev, d_rev, s, pick_top);
+        flush_day(name, cur_day, d_sess, d_ev, d_rev, s, pick_top, c);
     }
     // reset attribution window
     for &k in &s.active {
@@ -339,18 +359,31 @@ fn process_person(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn flush_day(
+    name: &[u8],
     day: i32,
     sessions: u32,
     events: u32,
     revenue: u64,
     s: &mut Scratch,
     pick_top: &impl Fn(&[u64], &[u16]) -> Option<u16>,
+    c: &Cleaned,
 ) {
     let top = pick_top(&s.catsum, &s.cat_touched);
     for &k in &s.cat_touched {
         s.catsum[k as usize] = 0;
     }
     s.cat_touched.clear();
-    s.rows.push(UserRow { part: 0, person: s.cur_person, day, sessions, events, revenue, top_cat: top });
+    let u = &mut s.ucols;
+    u[0].push_str(name);
+    u[1].push_i32(day);
+    u[2].push_i64(sessions as i64);
+    u[3].push_i64(events as i64);
+    u[4].push_i64(revenue as i64);
+    match top {
+        Some(t) => u[5].push_str(&c.cat_names[t as usize]),
+        None => u[5].push_null(),
+    }
+    s.urows += 1;
 }

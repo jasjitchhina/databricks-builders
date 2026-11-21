@@ -6,7 +6,7 @@ COPY fast/Cargo.toml fast/Cargo.lock ./
 COPY fast/.cargo ./.cargo
 RUN mkdir -p src/bin && echo 'fn main(){}' > src/main.rs && echo '' > src/lib.rs \
  && echo 'fn main(){}' > src/bin/pq2csv.rs && echo 'fn main(){}' > src/bin/prepdump.rs \
- && cargo build --release --locked && rm -rf src
+ && cargo build --release --locked --bin fast && rm -rf src
 COPY fast/src ./src
 RUN find src -name "*.rs" -exec touch {} + && cargo build --release --locked --bin fast && strip target/release/fast
 
