@@ -3,6 +3,7 @@ pub mod clean;
 pub mod csv;
 pub mod engine;
 pub mod ids;
+pub mod keys;
 pub mod loader;
 pub mod model;
 pub mod ts;

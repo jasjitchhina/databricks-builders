@@ -69,14 +69,19 @@ pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Maps a data file; None only for an empty file. Any I/O error is fatal:
+/// silently skipping an input file would give a wrong answer.
 pub fn map(p: &Path) -> Option<Mmap> {
-    let f = File::open(p).ok()?;
-    let len = f.metadata().ok()?.len();
+    let die = |what: &str, e: std::io::Error| -> ! {
+        eprintln!("fatal: {what} {}: {e}", p.display());
+        std::process::exit(2)
+    };
+    let f = File::open(p).unwrap_or_else(|e| die("open", e));
+    let len = f.metadata().unwrap_or_else(|e| die("stat", e)).len();
     if len == 0 {
         return None;
     }
-    let m = unsafe { Mmap::map(&f).ok()? };
-    Some(m)
+    Some(unsafe { Mmap::map(&f) }.unwrap_or_else(|e| die("mmap", e)))
 }
 
 /// A line-aligned byte range of a mapped file. `skip_header` is true for the

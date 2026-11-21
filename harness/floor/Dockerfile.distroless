@@ -1,0 +1,6 @@
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY true-static /t
+COPY true-dyn /td
+COPY touchall /touchall
+USER 1000:1000
+CMD ["/t"]

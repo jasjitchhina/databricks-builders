@@ -2,7 +2,7 @@
 # Run fast binary on all fixtures, diff vs expected CSVs. Usage: fast/fixtures.sh [BIN]
 here=$(cd "$(dirname "$0")" && pwd)
 BIN=${1:-$here/target/release/fast}
-PQ=$here/target/release/pq2csv
+PQ=${PQ:-$here/../fast-tools/target/release/pq2csv}
 FX=$here/../fixtures
 tmp=$(mktemp -d)
 fail=0

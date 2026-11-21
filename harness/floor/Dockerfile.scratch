@@ -1,0 +1,4 @@
+FROM scratch
+COPY true-static /t
+USER 1000:1000
+CMD ["/t"]

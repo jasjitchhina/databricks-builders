@@ -18,15 +18,59 @@ pub struct Cleaned {
     pub parts: Vec<Part>,
 }
 
+/// Rows of a part: an owned Vec, or a slice in memory the clean stage
+/// recycled from its dead intermediates (no fresh page faults). Read it as a
+/// slice (Deref); `push` only works on the owned form.
+pub enum Rows<T: 'static> {
+    Owned(Vec<T>),
+    Static(&'static mut [T]),
+}
+
+impl<T> Default for Rows<T> {
+    fn default() -> Self {
+        Rows::Owned(Vec::new())
+    }
+}
+
+impl<T> std::ops::Deref for Rows<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        match self {
+            Rows::Owned(v) => v,
+            Rows::Static(s) => s,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for Rows<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Rows::Owned(v) => v,
+            Rows::Static(s) => s,
+        }
+    }
+}
+
+impl<T> Rows<T> {
+    pub fn push(&mut self, x: T) {
+        match self {
+            Rows::Owned(v) => v.push(x),
+            Rows::Static(_) => panic!("push on static rows"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Part {
     /// part-local person index -> person name (byte-wise smallest linked ID).
     pub person_names: Vec<Box<[u8]>>,
     /// surviving events (after dedup, validation, late drop), unsorted.
-    pub ev: Vec<Ev>,
+    pub ev: Rows<Ev>,
     /// valid clicks (not deduped: copies are identical), unsorted. Only clicks
     /// of persons that have at least one surviving event are included.
-    pub cl: Vec<Cl>,
+    pub cl: Rows<Cl>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

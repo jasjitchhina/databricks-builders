@@ -36,12 +36,12 @@ fn main() {
     let mut cl = Vec::new();
     let mut ids: std::collections::HashMap<u128, Vec<u8>> = Default::default();
     for p in &c.parts {
-        for e in &p.ev {
+        for e in p.ev.iter() {
             let cat = if e.price > 0 { s(&c.cat_names[e.cat as usize]) } else { String::new() };
             ev.push(format!("{},{},{},{}", s(&p.person_names[e.person as usize]), e.ts as i64 + c.base_ms, e.price, cat));
         }
-        for k in &p.cl {
-            ids.entry(k.click_id).or_insert_with(|| fast::ids::key_bytes(k.click_id).into());
+        for k in p.cl.iter() {
+            ids.entry(k.click_id).or_insert_with(|| fast::clean::click_id_bytes(k.click_id).into());
             cl.push(format!("{},{},{},{}", s(&ids[&k.click_id]), s(&p.person_names[k.person as usize]), s(&c.camp_ids[k.camp as usize]), k.ts as i64 + c.base_ms));
         }
     }

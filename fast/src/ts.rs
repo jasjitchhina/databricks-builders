@@ -64,6 +64,79 @@ fn digits_ok(x: u64, m: u64) -> bool {
 /// Parses `YYYY-MM-DDTHH:MM:SS` (first 19 bytes of b, b.len() >= 20) to epoch ms, validating the calendar.
 #[inline(always)]
 fn civil19(b: &[u8]) -> Option<i64> {
+    #[cfg(target_feature = "avx2")]
+    {
+        return unsafe { civil19_simd(b.as_ptr()) };
+    }
+    #[allow(unreachable_code)]
+    civil19_swar(b)
+}
+
+/// SSE version of `civil19_swar` (reads bytes 0..20 of p).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn civil19_simd(p: *const u8) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let lo = _mm_loadu_si128(p as *const __m128i); // bytes 0..16
+    let hi = _mm_loadu_si128(p.add(4) as *const __m128i); // bytes 4..20
+    // separators: '-' at 4, 7; 'T' at 10; ':' at 13 (lo) and 16 (hi offset 12)
+    let sep_lo = _mm_shuffle_epi8(lo, _mm_setr_epi8(4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    let sep_hi = _mm_shuffle_epi8(hi, _mm_setr_epi8(-1, -1, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    let sep = _mm_or_si128(sep_lo, sep_hi);
+    let want = _mm_setr_epi8(b'-' as i8, b'-' as i8, b'T' as i8, b':' as i8, b':' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(sep, want)) != 0xFFFF {
+        return None;
+    }
+    // digits Y0..Y3 M0 M1 D0 D1 H0 H1 (lo: 0,1,2,3,5,6,8,9,11,12) m0 m1 S0 S1 (hi: 10,11,13,14)
+    let dl = _mm_shuffle_epi8(lo, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, -1, -1, -1, -1, -1, -1));
+    let dh = _mm_shuffle_epi8(hi, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 13, 14, -1, -1));
+    let dig = _mm_or_si128(dl, dh);
+    // lanes 14, 15 are 0; make them '0' so they pass the digit check
+    let dig = _mm_or_si128(dig, _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'0' as i8, b'0' as i8));
+    let d = _mm_sub_epi8(dig, _mm_set1_epi8(b'0' as i8));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+        return None;
+    }
+    // pairs -> u16: [Y0Y1, Y2Y3, MM, DD, hh, mm, ss, 0]
+    let v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let y = _mm_extract_epi16(v, 0) as i64 * 100 + _mm_extract_epi16(v, 1) as i64;
+    let mo = _mm_extract_epi16(v, 2) as i64;
+    let dd = _mm_extract_epi16(v, 3) as i64;
+    let h = _mm_extract_epi16(v, 4) as i64;
+    let mi = _mm_extract_epi16(v, 5) as i64;
+    let s = _mm_extract_epi16(v, 6) as i64;
+    finish_civil(y, mo, dd, h, mi, s)
+}
+
+#[inline(always)]
+fn finish_civil(y: i64, mo: i64, dd: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+    if !(1..=12).contains(&mo) || dd < 1 || h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days = if (YMIN..YMIN + YN as i64).contains(&y) {
+        let t = &*TABLES;
+        let i = (y - YMIN) as usize * 12 + mo as usize - 1;
+        if dd > t.mlen[i] as i64 {
+            return None;
+        }
+        t.days[i] as i64 + dd - 1
+    } else {
+        let mdays = match mo {
+            2 => if is_leap(y) { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if dd > mdays {
+            return None;
+        }
+        days_from_civil(y, mo, dd)
+    };
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn civil19_swar(b: &[u8]) -> Option<i64> {
     let a = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
     let c = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
     let e = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64 & 0x00FF_FFFF; // :SS
@@ -128,6 +201,50 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
         _ => {}
     }
     parse_f3(b)
+}
+
+/// `parse_ts` for a field inside mapping `m`: the F3 form uses a SIMD digit
+/// parser that reads the 16 bytes ending at the field's end when they lie in `m`.
+#[inline(always)]
+pub fn parse_ts_in(m: &[u8], b: &[u8]) -> Option<i64> {
+    match b.len() {
+        20 if b[19] == b'Z' => return civil19(b),
+        25 if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' => return parse_ts(b),
+        _ => {}
+    }
+    #[cfg(target_feature = "avx2")]
+    {
+        let n = b.len();
+        let end = b.as_ptr() as usize + n;
+        if n >= 1 && n <= 16 && end - 16 >= m.as_ptr() as usize && end <= m.as_ptr() as usize + m.len() {
+            return unsafe { f3_simd(b.as_ptr().add(n), n) };
+        }
+    }
+    let _ = m;
+    parse_f3(b)
+}
+
+/// Digits-only value of the n (1..=16) bytes ending at `end` (the 16 bytes
+/// before `end` must be readable).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn f3_simd(end: *const u8, n: usize) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let x = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let pre = _mm_cmpgt_epi8(_mm_set1_epi8((16 - n) as i8), idx);
+    let x = _mm_blendv_epi8(x, _mm_set1_epi8(b'0' as i8), pre);
+    let d = _mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+        return None;
+    }
+    let p = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let q = _mm_madd_epi16(p, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let r = _mm_packus_epi32(q, q);
+    let t = _mm_madd_epi16(r, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(t) as u32 as u64;
+    let lo = _mm_extract_epi32(t, 1) as u32 as u64;
+    Some((hi * 100_000_000 + lo) as i64)
 }
 
 #[inline]
@@ -240,15 +357,19 @@ mod fuzz {
     fn differential() {
         let mut seed = 99u64;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
-        let templates: [&[u8]; 4] = [b"2028-02-29T23:59:59Z", b"2027-12-31T00:00:00+05:30", b"1999-09-09T09:09:09-00:00", b"0001791071890000"];
+        let templates: [&[u8]; 8] = [b"2028-02-29T23:59:59Z", b"2027-12-31T00:00:00+05:30", b"1999-09-09T09:09:09-00:00", b"0001791071890000", b"1791071890000", b"9999999999999999", b"7", b"00000000000000000001791071890000"];
         let alpha = b"0123456789-+:TZtz /\x7f\xff";
         for _ in 0..2_000_000 {
-            let mut v = templates[rnd() as usize % 4].to_vec();
+            let mut v = templates[rnd() as usize % 8].to_vec();
             for _ in 0..(rnd() % 3) {
                 let i = rnd() as usize % v.len();
                 v[i] = if rnd() % 2 == 0 { alpha[rnd() as usize % alpha.len()] } else { b'0' + (rnd() % 10) as u8 };
             }
             assert_eq!(parse_ts(&v), ref_ts(&v), "{:?}", String::from_utf8_lossy(&v));
+            let mut padded = vec![b'7'; 20];
+            padded.extend_from_slice(&v);
+            padded.extend_from_slice(b",x");
+            assert_eq!(parse_ts_in(&padded, &padded[20..20 + v.len()]), ref_ts(&v), "in {:?}", String::from_utf8_lossy(&v));
         }
     }
 }

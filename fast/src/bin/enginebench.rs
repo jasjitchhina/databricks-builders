@@ -1,4 +1,7 @@
 //! enginebench DATA [N]: clean once, then run engine N times (no output files); prints per-run ms.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static M: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let n: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -9,7 +12,11 @@ fn main() {
     let mut v = vec![vec![]; nv as usize];
     for _ in 0..n {
         for var in 0..nv {
-            fast::engine::VARIANT.store(var, std::sync::atomic::Ordering::Relaxed);
+            let radix_mode = std::env::var_os("ABRADIX").is_some();
+            fast::engine::VARIANT.store(if radix_mode { 0 } else { var }, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(r) = std::env::var(format!("RADIX_MIN{var}")) {
+                fast::engine::RADIX_MIN.store(r.parse().unwrap(), std::sync::atomic::Ordering::Relaxed);
+            }
             let t = std::time::Instant::now();
             let o = fast::engine::run(&c, false, None);
             v[var as usize].push(t.elapsed().as_secs_f64() * 1e3);
@@ -25,6 +32,7 @@ fn main() {
         sizes.sort();
         eprintln!("parts ev/cl/persons: min {:?} med {:?} max {:?}", sizes[0], sizes[sizes.len()/2], sizes[sizes.len()-1]);
     }
+    eprintln!("first run {:.1} ms", v[0][0]);
     for (i, v) in v.iter_mut().enumerate() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         eprintln!("variant {i} engine ms: min {:.1} med {:.1} max {:.1}", v[0], v[n / 2], v[n - 1]);

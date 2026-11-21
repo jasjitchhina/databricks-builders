@@ -1,7 +1,7 @@
 #!/bin/bash
 # devcheck.sh DATA ANSWER_DIR(with user_daily.csv,campaign_daily.csv) [BIN]
 here=$(cd "$(dirname "$0")" && pwd)
-BIN=${3:-$here/target/release/fast}; PQ=$here/target/release/pq2csv
+BIN=${3:-$here/target/release/fast}; PQ=${PQ:-$here/../fast-tools/target/release/pq2csv}
 tmp=$(mktemp -d); rc=0
 FAST_TIMING=1 "$BIN" "$1" "$tmp/out" || exit 1
 for t in user_daily campaign_daily; do
