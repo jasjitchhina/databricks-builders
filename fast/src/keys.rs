@@ -316,10 +316,11 @@ impl<K: IdKey> GSharded<K> {
     /// shard/slot bits).
     #[inline(always)]
     fn fbits(&self, h: u64) -> (usize, u64) {
-        let mut x = h.rotate_left(21).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        x ^= x >> 31;
-        let w = (x as usize) & self.fmask;
-        let b = (1u64 << ((x >> 40) & 63)) | (1u64 << ((x >> 46) & 63)) | (1u64 << ((x >> 52) & 63));
+        // h is already a full 64-bit mix: take the word from bits 14.. (above the slot
+        // bits) and the three bit positions from bits 35..52 (below the shard bits 56..63,
+        // which are constant within a shard); insert and test use the same function.
+        let w = ((h >> 14) as usize) & self.fmask;
+        let b = (1u64 << ((h >> 35) & 63)) | (1u64 << ((h >> 41) & 63)) | (1u64 << ((h >> 47) & 63));
         (w, b)
     }
     #[inline(always)]
