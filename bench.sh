@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # bench.sh: the ONLY sanctioned way to time the pipeline.
 #
-#   ./bench.sh [-n RUNS] [-i IMAGE] [--no-build] [DATASET ...]
+#   ./bench.sh [-n RUNS] [-i IMAGE | -r GITREV] [--no-build] [DATASET ...]
 #
+# -r GITREV builds that commit/branch (e.g. wt/h4, main) from a clean `git archive` export instead of
+# this worktree, so any helper's committed state can be benched without touching their worktree.
 # DATASET is a dir name under ~/data (dev, s7-20m, s11-60m, ...) or a path. Default: s7-20m.
 # Builds the repo-root Dockerfile (shared lock), then takes the EXCLUSIVE lock /tmp/bench.lock
 # and runs the image with the scorer's limits RUNS times (default 3) per dataset.
@@ -15,6 +17,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 DATA_ROOT=${DATA_ROOT:-$HOME/data}
 RUNS=3
+REV=""
 IMAGE=""
 BUILD=1
 DATASETS=()
@@ -22,6 +25,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -n) RUNS=$2; shift 2 ;;
     -i) IMAGE=$2; BUILD=0; shift 2 ;;
+    -r) REV=$2; shift 2 ;;
     --no-build) BUILD=0; shift ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) DATASETS+=("$1"); shift ;;
@@ -29,18 +33,28 @@ while [ $# -gt 0 ]; do
 done
 [ ${#DATASETS[@]} -gt 0 ] || DATASETS=(s7-20m)
 
-COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)
-DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -v '^??' | head -1 || true)
-[ -n "$DIRTY" ] && COMMIT="$COMMIT-dirty"
-BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit)
+CTX="$ROOT"
+if [ -n "$REV" ]; then
+  COMMIT=$(git -C "$ROOT" rev-parse --short "$REV^{commit}")
+  BRANCH=$REV
+  CTX=$(mktemp -d "$DATA_ROOT/scratch/benchctx.XXXXXX")
+  git -C "$ROOT" archive "$COMMIT" | tar -x -C "$CTX"
+  [ -n "$IMAGE" ] || IMAGE="bench-rev-$COMMIT:latest"
+else
+  COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)
+  DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -v '^??' | head -1 || true)
+  [ -n "$DIRTY" ] && COMMIT="$COMMIT-dirty"
+  BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit)
+fi
 
 if [ -z "$IMAGE" ]; then
   IMAGE="bench-$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.\n-' '-'):latest"
 fi
 if [ "$BUILD" = 1 ]; then
-  echo "== building $IMAGE from $ROOT ($COMMIT)" >&2
-  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$IMAGE" "$ROOT" >&2
+  echo "== building $IMAGE from $CTX ($COMMIT)" >&2
+  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$IMAGE" "$CTX" >&2
 fi
+[ -n "$REV" ] && rm -rf "$CTX"
 
 WORK="$DATA_ROOT/bench/work.$$"
 mkdir -p "$DATA_ROOT/bench"
