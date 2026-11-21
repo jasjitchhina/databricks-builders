@@ -318,7 +318,7 @@ impl Lookups {
 }
 
 struct ParseState<K: IdKey> {
-    ev: crate::alloc::BlockRegions<ERec<K>, 4>,
+    ev: WcRegions<ERec<K>, 4>,
     side: Vec<(u32, u16)>,
     cl: WcRegions<CRec<K>, 8>,
     cbuf: Vec<CRec<K>>,
@@ -465,7 +465,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
         threads,
         chunks.len(),
         |_| ParseState::<K> {
-            ev: crate::alloc::BlockRegions::new(nb, huge),
+            ev: WcRegions::new_with(nb, ev_cap, huge),
             side: Vec::with_capacity(ev_cap * nb / 20),
             cl: WcRegions::new_with(NPART, cl_cap, huge),
             cbuf: Vec::new(),
@@ -723,7 +723,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
         let parts_ref = &parts_out;
         let part_states = par_items(threads, NPART, |t| {
             // recycle this thread's dead event-bucket buffer (dedup is done with it)
-            let slabs = if t < states.len() && recycle { states[t].ev.slabs() } else { Vec::new() };
+            let slabs = if t < states.len() && recycle { vec![states[t].ev.raw()] } else { Vec::new() };
             (unsafe { crate::alloc::Bump::multi(slabs) }, GMap::<K, u32>::with_capacity(4096), Vec::<K>::new())
         }, |(bump, local, names), p| {
             let n: usize = deduped.iter().map(|(_, _, _, o, _, _, _)| o.len_of(p)).sum();
