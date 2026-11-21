@@ -11,6 +11,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
+static EV_NS: AtomicUsize = AtomicUsize::new(0);
+static CL_NS: AtomicUsize = AtomicUsize::new(0);
+struct Defer<F: FnMut()>(F);
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
 const NB_BITS: u32 = 8;
 const NB: usize = 1 << NB_BITS; // dedup buckets
 const CHUNK: usize = 2 << 20;
@@ -144,7 +152,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
         |st, i| {
             let c = chunks[i];
             let m: &[u8] = maps[c.file].as_ref().unwrap();
-            csv::scan::<2>(m, c.start, c.end, |[a, b]| {
+            csv::scan::<2, _>(m, c.start, c.end, |[a, b]| {
                 if !a.is_empty() && !b.is_empty() && a != b {
                     for k in [pack_in(m, a), pack_in(m, b)] {
                         let r = (st.t << 27) | st.n_ep;
@@ -227,19 +235,21 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             }
         }
     }
-    let shards: Vec<Mutex<Option<KeyMap>>> = (0..LS).map(|_| Mutex::new(None)).collect();
+    let mut per_shard = vec![0usize; LS];
+    for s in 0..LS {
+        per_shard[s] = (0..shard_keys[s].len()).filter(|&l| name[roots[base[s] as usize + l] as usize] != shard_keys[s][l]).count();
+    }
+    let map = ShardedMap::new(per_shard.iter().copied().max().unwrap_or(0));
     par_items(threads, LS, |_| (), |_, s| {
         let keys = &shard_keys[s];
-        let mut tab = KeyMap::with_capacity(keys.len());
         for (l, &k) in keys.iter().enumerate() {
             let nm = name[roots[base[s] as usize + l] as usize];
             if nm != k {
-                tab.insert(k, nm);
+                unsafe { map.insert_shard(s, k, nm) };
             }
         }
-        *shards[s].lock().unwrap() = Some(tab);
     });
-    ShardedMap { shards: shards.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect() }
+    map
 }
 
 struct Lookups {
@@ -249,6 +259,8 @@ struct Lookups {
 }
 
 struct ParseState {
+    mode: u8,
+    acc: u64,
     ev: Vec<Vec<ERec>>,
     side: Vec<(u32, u16)>,
     cl: Vec<Vec<CRec>>,
@@ -323,6 +335,8 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         threads,
         chunks.len(),
         |_| ParseState {
+            mode: 0,
+            acc: 0,
             ev: (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
             side: Vec::with_capacity(ev_cap * NB / 20),
             cl: (0..NPART).map(|_| Vec::with_capacity(cl_cap)).collect(),
@@ -331,11 +345,13 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         |st, i| {
             let c = chunks[i];
             let m: &[u8] = maps[c.file].as_ref().unwrap();
+            let _t0 = Instant::now();
+            let _g = Defer(|| { let ns = _t0.elapsed().as_nanos() as usize; if c.file < n_ev_files { EV_NS.fetch_add(ns, Ordering::Relaxed); } else { CL_NS.fetch_add(ns, Ordering::Relaxed); } });
             if c.file < n_ev_files {
-                csv::scan::<7>(m, c.start, c.end, |f| parse_event(m, f, ws, we, base, &lk, st));
+                csv::scan::<7, _>(m, c.start, c.end, |f| parse_event(m, f, ws, we, base, &lk, st));
             } else {
                 st.cbuf.clear();
-                csv::scan::<4>(m, c.start, c.end, |[cid, user, camp, ts]| {
+                csv::scan::<4, _>(m, c.start, c.end, |[cid, user, camp, ts]| {
                     if cid.is_empty() || user.is_empty() {
                         return;
                     }
@@ -363,6 +379,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             }
         },
     );
+    if std::env::var_os("FAST_VERBOSE").is_some() { eprintln!("[clean]   cpu: events {:.1} ms, clicks {:.1} ms", EV_NS.load(Ordering::Relaxed) as f64 / 1e6, CL_NS.load(Ordering::Relaxed) as f64 / 1e6); }
     t("parse");
 
     // dedup by event_id, per bucket
@@ -371,20 +388,20 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     let deduped = par_items(
         threads,
         NB,
-        |_| (Vec::<u64>::new(), Vec::<(Key, u32, u32, u16)>::new(), (0..NPART).map(|_| Vec::<PRec>::with_capacity(out_cap)).collect::<Vec<_>>()),
-        |(table, surv, out), b| {
+        |_| (Vec::<u64>::new(), Vec::<(Key, u32, u32, u16)>::new(), Vec::<u32>::new(), (0..NPART).map(|_| Vec::<PRec>::with_capacity(out_cap)).collect::<Vec<_>>()),
+        |(table, surv, losers, out), b| {
             let n: usize = states.iter().map(|s| s.ev[b].len()).sum();
             if n == 0 {
                 return;
             }
-            let cap = (n * 2).next_power_of_two();
+            let cap = (n + n / 2).next_power_of_two().max(64);
             table.clear();
             table.resize(cap, 0);
             let mask = cap - 1;
             let get = |r: u32| -> &ERec { unsafe { states.get_unchecked((r >> 26) as usize).ev.get_unchecked(b).get_unchecked((r & ((1 << 26) - 1)) as usize) } };
+            losers.clear();
             for (ti, s) in states.iter().enumerate() {
-                let v = &s.ev[b];
-                for (ri, r) in v.iter().enumerate() {
+                s.ev[b].iter().enumerate().for_each(|(ri, r)| {
                     let h = hk(r.eid);
                     let tag = h >> 32;
                     let mut i = (h >> NB_BITS) as usize & mask;
@@ -401,26 +418,33 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                             if old.eid == r.eid {
                                 if r.ingest < old.ingest {
                                     *slot = (tag << 32) | (me as u64 + 1);
+                                    losers.push(o);
+                                } else {
+                                    losers.push(me);
                                 }
                                 break;
                             }
                         }
                         i = (i + 1) & mask;
                     }
-                }
+                });
             }
+            losers.sort_unstable();
             surv.clear();
-            for &e in table.iter() {
-                if e == 0 {
-                    continue;
-                }
-                let o = (e as u32).wrapping_sub(1);
-                let r = get(o);
-                if r.ts == NOT_OK {
-                    continue;
-                }
-                let (price, cat) = if r.pc == 0 { (0, 0) } else { states[(o >> 26) as usize].side[r.pc as usize - 1] };
-                surv.push((r.user, r.ts, price, cat));
+            let mut li = 0;
+            for (ti, s) in states.iter().enumerate() {
+                s.ev[b].iter().enumerate().for_each(|(ri, r)| {
+                    let me = ((ti as u32) << 26) | ri as u32;
+                    if li < losers.len() && losers[li] == me {
+                        li += 1;
+                        return;
+                    }
+                    if r.ts == NOT_OK {
+                        return;
+                    }
+                    let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
+                    surv.push((r.user, r.ts, price, cat));
+                });
             }
             let n = surv.len();
             for j in 0..n {
@@ -441,12 +465,12 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     {
         let parts_ref = &parts_out;
         par_items(threads, NPART, |_| (), |_, p| {
-            let n: usize = deduped.iter().map(|(_, _, o)| o[p].len()).sum();
+            let n: usize = deduped.iter().map(|(_, _, _, o)| o[p].len()).sum();
             let mut local = KeyMap::with_capacity(1024);
             let mut names: Vec<Key> = Vec::new();
             let mut ev: Vec<Ev> = Vec::with_capacity(n);
-            for (_, _, o) in deduped.iter() {
-                for r in &o[p] {
+            for (_, _, _, o) in deduped.iter() {
+                o[p].iter().for_each(|r| {
                     let id = match local.get(r.person) {
                         Some(v) => v as u32,
                         None => {
@@ -457,15 +481,15 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                         }
                     };
                     ev.push(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat });
-                }
+                });
             }
             let mut cl: Vec<Cl> = Vec::new();
             for s in states.iter() {
-                for r in &s.cl[p] {
+                s.cl[p].iter().for_each(|r| {
                     if let Some(v) = local.get(r.person) {
                         cl.push(Cl { click_id: r.cid, person: v as u32, ts: r.ts, camp: r.camp });
                     }
-                }
+                });
             }
             let person_names = names.into_iter().map(key_bytes).collect();
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
@@ -556,5 +580,78 @@ fn parse_event(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookup
         rec.user = pack_in(m, user);
         rec.ts = (t - base) as u32;
     }
+    if st.mode != 0 {
+        if st.mode == 2 {
+            st.acc = st.acc.wrapping_add(rec.ts as u64 ^ rec.user as u64 ^ rec.ingest as u64 ^ rec.eid as u64);
+        } else {
+            unsafe { st.ev.get_unchecked_mut(0) }.push(rec);
+        }
+        return;
+    }
     unsafe { st.ev.get_unchecked_mut((hk(ek) & (NB as u64 - 1)) as usize) }.push(rec);
+}
+
+/// Single-thread microbenchmark of the event parse path over in-memory files
+/// (min of 5 reps), for optimization work only.
+pub fn microbench(dir: &Path) {
+    let (ws, we) = read_manifest(&dir.join("manifest.json"));
+    let base = ws - 7 * DAY_MS;
+    let mut products = KeyMap::with_capacity(60000);
+    data_lines(&dir.join("products.csv"), |line| {
+        if let Some([p, _c]) = csv::split::<2>(line) {
+            products.insert(pack(p), 1);
+        }
+    });
+    let lk = Lookups { products, unknown_cat: 0, campaigns: KeyMap::with_capacity(16) };
+    let mut data: Vec<u8> = Vec::new();
+    for f in csv::list_csv(&dir.join("events")) {
+        let b = std::fs::read(f).unwrap();
+        if let Some(h) = memchr::memchr(b'\n', &b) {
+            data.extend_from_slice(&b[h + 1..]);
+        }
+    }
+    data.extend_from_slice(&[0u8; 64]);
+    let n = data.len() - 64;
+    let lines = memchr::memchr_iter(b'\n', &data[..n]).count();
+    let run = |name: &str, f: &mut dyn FnMut() -> u64| {
+        let mut best = f64::MAX;
+        let mut chk = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            chk = f();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{:<10} {:>7.1} ns/line  {:>6.2} GB/s  (chk {})", name, best * 1e9 / lines as f64, n as f64 / best / 1e9, chk);
+    };
+    let m = &data[..];
+    run("newlines", &mut || memchr::memchr_iter(b'\n', &m[..n]).count() as u64);
+    run("scan", &mut || {
+        let mut x = 0u64;
+        csv::scan::<7, _>(m, 0, n, |f| x += f[2].len() as u64);
+        x
+    });
+    run("scan+ts", &mut || {
+        let mut x = 0u64;
+        csv::scan::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+pack", &mut || {
+        let mut x = 0u64;
+        csv::scan::<7, _>(m, 0, n, |f| x = x.wrapping_add(hk(pack_in(m, f[0])) ^ pack_in(m, f[1]) as u64));
+        x
+    });
+    for mode in [1u8, 2, 0] {
+        run(["full", "nopush", "seqpush"][mode as usize], &mut || {
+            let mut st = ParseState {
+                ev: (0..NB).map(|_| Vec::with_capacity(lines / NB * 2)).collect(),
+                side: Vec::with_capacity(lines / 10),
+                cl: Vec::new(),
+                cbuf: Vec::new(),
+                mode,
+                acc: 0,
+            };
+            csv::scan::<7, _>(m, 0, n, |f| parse_event(m, f, ws, we, base, &lk, &mut st));
+            st.acc + st.ev.iter().map(|v| v.len() as u64).sum::<u64>()
+        });
+    }
 }

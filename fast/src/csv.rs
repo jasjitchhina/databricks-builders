@@ -189,44 +189,45 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+#[inline(always)]
+fn emit<'a, const N: usize, F: FnMut([&'a [u8]; N])>(buf: &'a [u8], ls: usize, le: usize, seps: &[usize; N], nsep: usize, qcount: u32, f: &mut F) {
+    if nsep != N - 1 {
+        return;
+    }
+    let mut fl: [&'a [u8]; N] = [&[]; N];
+    let mut s = ls;
+    for k in 0..N {
+        let e = if k < N - 1 { seps[k] } else { le };
+        fl[k] = unsafe { buf.get_unchecked(s..e) };
+        s = e + 1;
+    }
+    if qcount != 0 {
+        let mut wrapped = 0u32;
+        for fld in fl.iter_mut() {
+            let n = fld.len();
+            if n >= 2 && fld[0] == b'"' && fld[n - 1] == b'"' {
+                *fld = &fld[1..n - 1];
+                wrapped += 2;
+            }
+        }
+        if wrapped != qcount {
+            return;
+        }
+    }
+    f(fl);
+}
+
 /// Fast line scanner: for every well-formed line with exactly N fields in
 /// `buf[start..end]` (line aligned), calls `f` with the unquoted fields.
 /// Malformed lines are skipped. A final line without '\n' at `end` counts.
 #[inline(always)]
-pub fn scan<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: impl FnMut([&'a [u8]; N])) {
+pub fn scan<'a, const N: usize, F: FnMut([&'a [u8]; N])>(buf: &'a [u8], start: usize, end: usize, mut f: F) {
     let mut seps = [0usize; N];
     let mut nsep = 0usize;
     let mut ls = start;
     let mut qcount = 0u32;
     let mut pos = start;
     let mut tmp = [0u8; 64];
-    let emit = |ls: usize, le: usize, seps: &[usize; N], nsep: usize, qcount: u32, f: &mut dyn FnMut([&'a [u8]; N])| {
-        if nsep != N - 1 {
-            return;
-        }
-        let mut fl: [&'a [u8]; N] = [&[]; N];
-        let mut s = ls;
-        for k in 0..N {
-            let e = if k < N - 1 { seps[k] } else { le };
-            fl[k] = unsafe { buf.get_unchecked(s..e) };
-            s = e + 1;
-        }
-        if qcount != 0 {
-            let mut wrapped = 0u32;
-            for fld in fl.iter_mut() {
-                let n = fld.len();
-                if n >= 2 && fld[0] == b'"' && fld[n - 1] == b'"' {
-                    *fld = &fld[1..n - 1];
-                    wrapped += 2;
-                }
-            }
-            if wrapped != qcount {
-                return;
-            }
-        }
-        f(fl);
-    };
-    let mut fdyn = |x: [&'a [u8]; N]| f(x);
     while pos < end {
         let rem = end - pos;
         let (sep, nl, mut q) = unsafe {
@@ -250,7 +251,7 @@ pub fn scan<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: 
                 let low = q & (bit - 1);
                 qcount += low.count_ones();
                 q ^= low;
-                emit(ls, abs, &seps, nsep, qcount, &mut fdyn);
+                emit::<N, F>(buf, ls, abs, &seps, nsep, qcount, &mut f);
                 ls = abs + 1;
                 nsep = 0;
                 qcount = 0;
@@ -266,7 +267,7 @@ pub fn scan<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: 
         pos += 64;
     }
     if ls < end {
-        emit(ls, end, &seps, nsep, qcount, &mut fdyn);
+        emit::<N, F>(buf, ls, end, &seps, nsep, qcount, &mut f);
     }
 }
 
@@ -292,7 +293,7 @@ mod scan_tests {
     use super::*;
     fn collect<const N: usize>(b: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut v = Vec::new();
-        scan::<N>(b, 0, b.len(), |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        scan::<N, _>(b, 0, b.len(), |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
         v
     }
     fn slow<const N: usize>(b: &[u8]) -> Vec<Vec<Vec<u8>>> {
