@@ -140,6 +140,17 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
+/// True when this process cannot get transparent huge pages: THP disabled for the
+/// process tree (prctl PR_SET_THP_DISABLE, invisible in sysfs) or system-wide "never".
+/// Unknown (sysfs not readable) counts as available. Only picks a tuning default.
+fn thp_unavailable() -> bool {
+    // SAFETY: PR_GET_THP_DISABLE takes no pointer arguments
+    if unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) } == 1 {
+        return true;
+    }
+    std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|v| v.windows(7).any(|w| w == b"[never]"))
+}
+
 const LS: usize = 256; // link shards (== ShardedMap shards)
 
 /// Link stage 1 output: interned link IDs and the endpoint -> id table.
@@ -463,7 +474,13 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     // dedup buckets: 1024. More buckets speed up dedup at 60M but slow the
     // parse (more write-combining stages competing for L2); with 2-bit
     // counters 1024 is as good as 2048 at 60M and best at 20M (HT-like A/B).
-    let nb_bits: u32 = std::env::var("FAST_NB_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(NB_BITS).clamp(6, 14);
+    // Without THP every 128 B WC flush of the 1024-region push lands on its own 4K
+    // page (TLB miss per flush); 512 regions measured -1.5% there, +1% with THP.
+    let nb_default = if thp_unavailable() { NB_BITS - 1 } else { NB_BITS };
+    let nb_bits: u32 = std::env::var("FAST_NB_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(nb_default).clamp(6, 14);
+    if std::env::var_os("FAST_VERBOSE").is_some() {
+        eprintln!("[clean] dedup buckets 2^{nb_bits} (thp unavailable: {})", nb_default != NB_BITS);
+    }
     let nb = 1usize << nb_bits;
     let nbm = (nb - 1) as u64;
     let ev_cap = ev_est * 5 / 4 / nb / threads + 64;
