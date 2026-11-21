@@ -100,9 +100,9 @@ for _ in range(PEOPLE):
         links.append((ids[0], ids[0]))
     persons.append(ids)
 
-chain = [new_id() for _ in range(20000)]
+chain = [new_id() for _ in range(int(os.environ.get("CHAIN", 20000)))]
 link_chain(chain)
-star = [new_id() for _ in range(5000)]
+star = [new_id() for _ in range(int(os.environ.get("STAR", 5000)))]
 for s in star[1:]:
     links.append((star[0], s) if R.random() < 0.5 else (s, star[0]))
 persons.append(chain)
