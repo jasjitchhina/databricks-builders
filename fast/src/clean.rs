@@ -138,9 +138,15 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 
 const LS: usize = 256; // link shards (== ShardedMap shards)
 
-/// Union-find over all link lines; returns id -> name for every linked id
-/// whose name is not itself. None: an ID is not representable as K.
-fn build_links<K: IdKey>(dir: &Path, threads: usize) -> Option<GSharded<K>> {
+/// Link stage 1 output: interned link IDs and the endpoint -> id table.
+struct LinkPre<K: IdKey> {
+    ep: Vec<Vec<AtomicU32>>,
+    shard_keys: Vec<Vec<K>>,
+}
+
+/// Link stage 1 (parallel): parse every link line and intern its IDs.
+/// None: an ID is not representable as K.
+fn links_stage1<K: IdKey>(dir: &Path, threads: usize) -> Option<LinkPre<K>> {
     let mut t = timer();
     let files = csv::list_csv(&dir.join("links"));
     let maps: Vec<Option<Mmap>> = files.iter().map(|p| csv::map(p)).collect();
@@ -217,6 +223,17 @@ fn build_links<K: IdKey>(dir: &Path, threads: usize) -> Option<GSharded<K>> {
     });
     let shard_keys: Vec<Vec<K>> = shard_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
     t(" L intern");
+    std::mem::forget(per);
+    std::mem::forget(maps);
+    Some(LinkPre { ep, shard_keys })
+}
+
+/// Link stage 2: union-find (union by key order, so every root is its
+/// component's byte-wise smallest ID = the person's name) and the id -> name
+/// map for every linked id whose name is not itself.
+fn links_stage2<K: IdKey>(pre: LinkPre<K>, threads: usize) -> GSharded<K> {
+    let mut t = timer();
+    let LinkPre { ep, shard_keys } = pre;
     let mut base = vec![0u32; LS + 1];
     for s in 0..LS {
         base[s + 1] = base[s] + shard_keys[s].len() as u32;
@@ -271,7 +288,10 @@ fn build_links<K: IdKey>(dir: &Path, threads: usize) -> Option<GSharded<K>> {
         }
     });
     t(" L map");
-    Some(map)
+    std::mem::forget(ep);
+    std::mem::forget(shard_keys);
+    std::mem::forget(lists);
+    map
 }
 
 struct Lookups {
@@ -373,8 +393,12 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     let (ws, we, base, lk) = (small.ws, small.we, small.base, &small.lk);
     let unknown_cat = lk.unknown_cat;
     let bad = AtomicBool::new(false);
-    let links = build_links::<K>(dir, threads)?;
-    t("links");
+    let pre = links_stage1::<K>(dir, threads)?;
+    t("links stage1");
+    // Stage 2 of links runs on its own thread while the workers parse events;
+    // click chunks (which need person = link name) come last and wait for it.
+    let link_cell: std::sync::OnceLock<GSharded<K>> = std::sync::OnceLock::new();
+    let link_thread_done = AtomicBool::new(false);
 
     // events + clicks
     let ev_files = csv::list_csv(&dir.join("events"));
@@ -382,8 +406,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     let n_ev_files = ev_files.len();
     let maps: Vec<Option<Mmap>> = ev_files.iter().chain(cl_files.iter()).map(|p| csv::map(p)).collect();
     let mut chunks: Vec<Chunk> = csv::chunks(&maps, CHUNK);
-    // clicks first: they are cheaper per byte, events then balance the tail
-    chunks.sort_by_key(|c| (c.file < n_ev_files) as u8);
+    // events first (no links needed), then clicks (wait for links stage 2)
+    chunks.sort_by_key(|c| (c.file >= n_ev_files) as u8);
     let ev_bytes: usize = maps[..n_ev_files].iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
     let cl_bytes: usize = maps[n_ev_files..].iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
     let ev_est = ev_bytes / 75;
@@ -394,7 +418,12 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     t("map+chunk");
 
     let cl_lo = base;
-    let states = par_items(
+    let states = std::thread::scope(|sc| {
+    sc.spawn(|| {
+        let _ = link_cell.set(links_stage2(pre, 2));
+        link_thread_done.store(true, Ordering::Release);
+    });
+    par_items(
         threads,
         chunks.len(),
         |_| ParseState::<K> {
@@ -423,6 +452,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                     bad.store(true, Ordering::Relaxed);
                 }
             } else {
+                let links = link_cell.wait();
                 st.cbuf.clear();
                 let mut ok = true;
                 csv::scan_fast::<4, _>(m, c.start, c.end, |[cid, user, camp, ts]| {
@@ -461,7 +491,10 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                 }
             }
         },
-    );
+    )
+    });
+    let links = link_cell.into_inner().expect("links stage 2");
+    let _ = link_thread_done.load(Ordering::Acquire);
     if std::env::var_os("FAST_VERBOSE").is_some() { eprintln!("[clean]   cpu: events {:.1} ms, clicks {:.1} ms", EV_NS.load(Ordering::Relaxed) as f64 / 1e6, CL_NS.load(Ordering::Relaxed) as f64 / 1e6); }
     if bad.load(Ordering::Relaxed) {
         // not representable as K: leak (cheaper than freeing) and let the caller rerun wider
