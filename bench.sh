@@ -55,6 +55,8 @@ else
   BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo nogit)
 fi
 
+if [ "$BUILD" = 0 ] && [ -n "$IMAGE" ] && [ -z "$REV" ]; then COMMIT="image"; BRANCH="-"; fi
+if [ -n "$IMAGE" ] && [ "$BUILD" = 0 ] && ! docker image inspect "$IMAGE" >/dev/null 2>&1; then echo "no such image $IMAGE (drop --no-build?)" >&2; exit 2; fi
 if [ -z "$IMAGE" ]; then
   IMAGE="bench-$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.\n-' '-'):latest"
 fi
