@@ -6,6 +6,7 @@ pub mod ids;
 pub mod keys;
 pub mod loader;
 pub mod model;
+pub mod prof;
 pub mod ts;
 pub mod pq;
 pub mod writer;
