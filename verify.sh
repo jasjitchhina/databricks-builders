@@ -9,7 +9,7 @@
 #   1. all fixtures/                      (expected CSVs, scripts/run_fixtures.py)
 #   2. check-dev                          (~/data/dev vs dev-answer/)
 #   3. row-exact diff vs the oracle cache (~/data/oracle/<ds>/out/, h1's layout) on $VERIFY_SETS
-#      default: s2-1m s3-1m s15-1m-feb29 + every ~/data/adv-* + s7-20m (20M) + s8-20m/s62-20m/s11-60m/s12-60m once their oracle DONE exists
+#      default: s2-1m s3-1m s15-1m-feb29 + every ~/data/adv-* + s7-20m (20M) + s8-20m/s62-20m/s11-60m/s12-60m/s21-100m (100M) once their oracle DONE exists
 # Env: QUICK=1 skips the 20M set. VERIFY_SETS="a b" overrides the oracle sets.
 #      ALLOW_MISSING_ORACLE=1 skips (instead of failing) sets with no oracle answer yet.
 # Builds and runs take the SHARED /tmp/bench.lock. Oracle answers are made by harness/oracle_cache.sh.
@@ -99,7 +99,7 @@ else
   if [ "${QUICK:-0}" != 1 ]; then
     SETS+=(s7-20m)
     # extra big sets join automatically once their oracle answer exists
-    for x in s8-20m s62-20m s11-60m s12-60m; do [ -f "$DATA_ROOT/oracle/$x/DONE" ] && SETS+=("$x"); done
+    for x in s8-20m s62-20m s11-60m s12-60m s21-100m; do [ -f "$DATA_ROOT/oracle/$x/DONE" ] && SETS+=("$x"); done
   fi
 fi
 echo "== [3] oracle diffs: ${SETS[*]}"
