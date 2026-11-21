@@ -13,6 +13,11 @@ pub trait IdKey: Copy + Eq + Send + Sync + Default + 'static {
     const WIDE: bool;
     /// Packs field `f` of mapping `m` (may over-read `m`). None: not representable.
     fn pack(m: &[u8], f: &[u8]) -> Option<Self>;
+    /// `(pack(m, a), pack(m, b))`, possibly in one vector pass.
+    #[inline(always)]
+    fn pack2(m: &[u8], a: &[u8], b: &[u8]) -> (Option<Self>, Option<Self>) {
+        (Self::pack(m, a), Self::pack(m, b))
+    }
     fn hash(self) -> u64;
     /// Byte-wise `a < b`.
     fn less(a: Self, b: Self) -> bool;
@@ -125,6 +130,43 @@ unsafe fn pack_simd(p: *const u8, n: usize) -> Option<u64> {
     Some((l0 << 40) | (l1 << 16) | (l2 >> 8))
 }
 
+/// Two `pack_simd`s in one 256-bit pass (a in the low lane, b in the high lane).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn pack2_simd(pa: *const u8, na: usize, pb: *const u8, nb: usize) -> (Option<u64>, Option<u64>) {
+    use std::arch::x86_64::*;
+    let b = _mm256_set_m128i(_mm_loadu_si128(pb as *const __m128i), _mm_loadu_si128(pa as *const __m128i));
+    let lo_n = _mm256_and_si256(b, _mm256_set1_epi8(0x0F));
+    let hi_n = _mm256_and_si256(_mm256_srli_epi16(b, 4), _mm256_set1_epi8(0x0F));
+    let class_lo = _mm256_broadcastsi128_si256(_mm_setr_epi8(5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 6, 2, 2, 2, 2, 10));
+    let class_hi = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, 0, 1, 2, 12, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0));
+    let cls = _mm256_and_si256(_mm256_shuffle_epi8(class_lo, lo_n), _mm256_shuffle_epi8(class_hi, hi_n));
+    let invalid = _mm256_cmpeq_epi8(cls, _mm256_setzero_si256());
+    let off_hi = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0));
+    let us = _mm256_cmpeq_epi8(b, _mm256_set1_epi8(b'_' as i8));
+    let off = _mm256_add_epi8(_mm256_shuffle_epi8(off_hi, hi_n), _mm256_and_si256(us, _mm256_set1_epi8(4)));
+    let code = _mm256_sub_epi8(b, off);
+    let valid = !(_mm256_movemask_epi8(invalid) as u32);
+    let idx = _mm256_broadcastsi128_si256(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    let nv = _mm256_set_m128i(_mm_set1_epi8(nb as i8), _mm_set1_epi8(na as i8));
+    let code = _mm256_and_si256(code, _mm256_cmpgt_epi8(nv, idx));
+    let pairs = _mm256_maddubs_epi16(code, _mm256_set1_epi16(0x0140));
+    let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
+    let lo = _mm256_castsi256_si128(quads);
+    let hi = _mm256_extracti128_si256(quads, 1);
+    let k = |q: __m128i| -> u64 {
+        let l0 = _mm_cvtsi128_si32(q) as u32 as u64;
+        let l1 = _mm_extract_epi32(q, 1) as u32 as u64;
+        let l2 = _mm_extract_epi32(q, 2) as u32 as u64;
+        (l0 << 40) | (l1 << 16) | (l2 >> 8)
+    };
+    let need_a = (1u32 << na) - 1;
+    let need_b = ((1u32 << nb) - 1) << 16;
+    let ra = if valid & need_a == need_a { Some(k(lo)) } else { None };
+    let rb = if valid & need_b == need_b { Some(k(hi)) } else { None };
+    (ra, rb)
+}
+
 #[inline(always)]
 fn pack_scalar(f: &[u8]) -> Option<u64> {
     let n = f.len();
@@ -162,6 +204,19 @@ impl IdKey for u64 {
         }
         let _ = m;
         pack_scalar(f)
+    }
+    #[inline(always)]
+    fn pack2(m: &[u8], a: &[u8], b: &[u8]) -> (Option<Self>, Option<Self>) {
+        #[cfg(target_feature = "avx2")]
+        {
+            let (na, nb) = (a.len(), b.len());
+            let oa = a.as_ptr() as usize - m.as_ptr() as usize;
+            let ob = b.as_ptr() as usize - m.as_ptr() as usize;
+            if na <= 10 && nb <= 10 && oa + 16 <= m.len() && ob + 16 <= m.len() {
+                return unsafe { pack2_simd(a.as_ptr(), na, b.as_ptr(), nb) };
+            }
+        }
+        (Self::pack(m, a), Self::pack(m, b))
     }
     #[inline(always)]
     fn hash(self) -> u64 {
@@ -466,6 +521,28 @@ pub fn part_of_h(h: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pack2_matches_pack() {
+        let alpha = b"09AZaz_-.!/:Mm5Qq\x00\xff \"";
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let mut buf = vec![0u8; 64];
+        for _ in 0..300_000 {
+            for b in buf.iter_mut() {
+                let r = rnd();
+                *b = if r % 5 == 0 { alpha[(r >> 8) as usize % alpha.len()] } else { b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"[(r >> 8) as usize % 63] };
+            }
+            let r = rnd();
+            let (sa, la) = ((r % 20) as usize, ((r >> 8) % 13) as usize);
+            let (sb, lb) = (((r >> 16) % 40) as usize, ((r >> 24) % 13) as usize);
+            let m = &buf[..];
+            let (a, b) = (&m[sa..sa + la], &m[sb..sb + lb]);
+            assert_eq!(<u64 as IdKey>::pack2(m, a, b), (<u64 as IdKey>::pack(m, a), <u64 as IdKey>::pack(m, b)), "{:?} {:?}", a, b);
+            let (a2, b2) = (&m[m.len() - la..], &m[m.len() - lb..]);
+            assert_eq!(<u64 as IdKey>::pack2(m, a2, b2), (<u64 as IdKey>::pack(m, a2), <u64 as IdKey>::pack(m, b2)));
+        }
+    }
+
     use super::*;
     #[test]
     fn compact_order_and_roundtrip() {
