@@ -34,8 +34,9 @@ struct Scratch {
     cnt: Vec<u32>,
     /// per active campaign: index (within the current day) of the first session it assists
     since: Vec<u32>,
-    active: Vec<u16>,
-    pos: Vec<u32>,
+    /// dedup stamps for close_all
+    mark: Vec<u32>,
+    stamp: u32,
     catsum: Vec<u64>,
     cat_touched: Vec<u16>,
     sess_cat: Vec<u64>,
@@ -229,7 +230,6 @@ pub struct Ctx {
     pub dump: bool,
     pub cat_names: Vec<Box<[u8]>>,
     pub camp_ids: Vec<Box<[u8]>>,
-    max_cat: usize,
 }
 
 impl Ctx {
@@ -269,7 +269,6 @@ impl Ctx {
             dump,
             cat_names: cat_names.to_vec(),
             camp_ids: camp_ids.to_vec(),
-            max_cat: cat_names.iter().map(|c| c.len()).max().unwrap_or(0),
         }
     }
     #[inline(always)]
@@ -316,8 +315,8 @@ impl Worker {
             s: Scratch {
                 cnt: vec![0; ncamp],
                 since: vec![0; ncamp],
-                active: vec![],
-                pos: vec![0; ncamp],
+                mark: vec![0; ncamp],
+                stamp: 0,
                 catsum: vec![0; ncat],
                 cat_touched: vec![],
                 sess_cat: vec![0; ncat],
@@ -483,6 +482,42 @@ fn process_person<E: EvT, C: ClT>(
     ctx: &Ctx,
 ) {
     let (organic, day0, dump) = (ctx.organic, ctx.day0, ctx.dump);
+    let Scratch { cnt, since, mark, stamp, catsum, cat_touched, sess_cat, sess_touched, camp, asst, ncamp1, ucols, urows, dump: dbuf, .. } = s;
+    let ncamp1 = *ncamp1;
+    let cnt = &mut cnt[..];
+    let since = &mut since[..];
+    let mark = &mut mark[..];
+    let catsum = &mut catsum[..];
+    let camp = &mut camp[..];
+    let asst = &mut asst[..];
+    // every campaign index in pc is < ncamp (validated against campaigns.csv); every
+    // category index < ncat; every day index < ndays (sessions start inside the window)
+    debug_assert!(pc.iter().all(|x| (x.camp() as usize) < cnt.len()));
+
+    // close out (for the day `di`) every campaign active in window [lo, hi): it assisted
+    // that day's sessions [since, d_sess)
+    #[inline(always)]
+    fn close_all<C: ClT>(pc: &[C], lo: usize, hi: usize, row: usize, d_sess: u32, cnt: &mut [u32], since: &mut [u32], mark: &mut [u32], stamp: &mut u32, asst: &mut [u32], reset_cnt: bool) {
+        *stamp = stamp.wrapping_add(1);
+        if *stamp == 0 {
+            mark.iter_mut().for_each(|m| *m = 0);
+            *stamp = 1;
+        }
+        for q in lo..hi {
+            let k = pc[q].camp() as usize;
+            unsafe {
+                if *mark.get_unchecked(k) != *stamp {
+                    *mark.get_unchecked_mut(k) = *stamp;
+                    *asst.get_unchecked_mut(row + k) += d_sess - *since.get_unchecked(k);
+                    *since.get_unchecked_mut(k) = 0;
+                    if reset_cnt {
+                        *cnt.get_unchecked_mut(k) = 0;
+                    }
+                }
+            }
+        }
+    }
+
     let mut lo = 0usize;
     let mut hi = 0usize;
     // current user-day accumulator
@@ -498,13 +533,8 @@ fn process_person<E: EvT, C: ClT>(
         // user-day aggregation: flush previous day before accumulating this session
         if day != cur_day {
             if cur_day != i32::MIN {
-                flush_day(name, cur_day, d_sess, d_ev, d_rev, s, ctx);
-                // assists: close out the old day for every active campaign
-                let row = (cur_day - day0) as usize * s.ncamp1;
-                for &k in &s.active {
-                    s.asst[row + k as usize] += d_sess - s.since[k as usize];
-                    s.since[k as usize] = 0;
-                }
+                flush_day(name, cur_day, d_sess, d_ev, d_rev, catsum, cat_touched, ucols, urows, ctx);
+                close_all(pc, lo, hi, (cur_day - day0) as usize * ncamp1, d_sess, cnt, since, mark, stamp, asst, false);
             }
             cur_day = day;
             d_sess = 0;
@@ -512,7 +542,6 @@ fn process_person<E: EvT, C: ClT>(
             d_rev = 0;
         }
         let mut prev = start;
-        let mut n = 0u32;
         let mut rev = 0u64;
         let mut j = i;
         while j < pe.len() {
@@ -521,49 +550,50 @@ fn process_person<E: EvT, C: ClT>(
                 break;
             }
             prev = e.ts();
-            n += 1;
             if e.price() > 0 {
                 rev += e.price() as u64;
                 let k = e.cat() as usize;
-                if s.catsum[k] == 0 {
-                    s.cat_touched.push(e.cat());
+                let cs = &mut catsum[k];
+                if *cs == 0 {
+                    cat_touched.push(e.cat());
                 }
-                s.catsum[k] += e.price() as u64;
+                *cs += e.price() as u64;
                 if dump {
-                    if s.sess_cat[k] == 0 {
-                        s.sess_touched.push(e.cat());
+                    if sess_cat[k] == 0 {
+                        sess_touched.push(e.cat());
                     }
-                    s.sess_cat[k] += e.price() as u64;
+                    sess_cat[k] += e.price() as u64;
                 }
             }
             j += 1;
         }
-        let purchased = rev > 0; // every purchase has price >= 1
+        let n = (j - i) as u32;
         i = j;
+        let row = (day - day0) as usize * ncamp1;
+        debug_assert!(((day - day0) as usize) < ctx.ndays);
 
         // attribution window [start - 7d, start]
         while hi < pc.len() && pc[hi].ts() <= start {
             let k = pc[hi].camp() as usize;
-            if s.cnt[k] == 0 {
-                s.pos[k] = s.active.len() as u32;
-                s.active.push(pc[hi].camp());
-                s.since[k] = d_sess; // assists this and later sessions of the day
+            unsafe {
+                let c = cnt.get_unchecked_mut(k);
+                if *c == 0 {
+                    *since.get_unchecked_mut(k) = d_sess; // assists this and later sessions of the day
+                }
+                *c += 1;
             }
-            s.cnt[k] += 1;
             hi += 1;
         }
         let wlo = start - WEEK_MS; // start >= window_start = base + 7d
         while lo < hi && pc[lo].ts() < wlo {
             let k = pc[lo].camp() as usize;
-            s.cnt[k] -= 1;
-            if s.cnt[k] == 0 {
-                // assisted the day's sessions [since, d_sess)
-                s.asst[(day - day0) as usize * s.ncamp1 + k] += d_sess - s.since[k];
-                let ps = s.pos[k] as usize;
-                let last = *s.active.last().unwrap();
-                s.active[ps] = last;
-                s.pos[last as usize] = ps as u32;
-                s.active.pop();
+            unsafe {
+                let c = cnt.get_unchecked_mut(k);
+                *c -= 1;
+                if *c == 0 {
+                    // assisted the day's sessions [since, d_sess)
+                    *asst.get_unchecked_mut(row + k) += d_sess - *since.get_unchecked(k);
+                }
             }
             lo += 1;
         }
@@ -583,23 +613,21 @@ fn process_person<E: EvT, C: ClT>(
             organic
         };
 
-        let di = (day - day0) as usize;
-        debug_assert!(di < ctx.ndays);
-        let row = di * s.ncamp1;
-        let ca = &mut s.camp[row + credited as usize];
+        let ca = unsafe { camp.get_unchecked_mut(row + credited as usize) };
         ca.sessions += 1;
-        ca.purchasing += purchased as u64;
+        ca.purchasing += (rev > 0) as u64; // every purchase has price >= 1
         ca.revenue += rev;
 
         if dump {
-            let top = ctx.pick_top(&s.sess_cat, &s.sess_touched);
-            for &k in &s.sess_touched {
-                s.sess_cat[k as usize] = 0;
+            let top = ctx.pick_top(sess_cat, sess_touched);
+            for &k in sess_touched.iter() {
+                sess_cat[k as usize] = 0;
             }
-            s.sess_touched.clear();
-            let mut assists: Vec<&[u8]> = s.active.iter().map(|&k| &*ctx.camp_ids[k as usize]).collect();
+            sess_touched.clear();
+            let mut assists: Vec<&[u8]> = (lo..hi).map(|q| &*ctx.camp_ids[pc[q].camp() as usize]).collect();
             assists.sort();
-            let d = &mut s.dump;
+            assists.dedup();
+            let d = &mut *dbuf;
             d.extend_from_slice(name);
             d.extend_from_slice(format!(",{},{},{},", ctx.base_ms + start as i64, n, rev).as_bytes());
             if let Some(t) = top {
@@ -621,16 +649,10 @@ fn process_person<E: EvT, C: ClT>(
         d_rev += rev;
     }
     if cur_day != i32::MIN {
-        flush_day(name, cur_day, d_sess, d_ev, d_rev, s, ctx);
+        flush_day(name, cur_day, d_sess, d_ev, d_rev, catsum, cat_touched, ucols, urows, ctx);
+        // close out assists of the last day and reset the attribution window
+        close_all(pc, lo, hi, (cur_day - day0) as usize * ncamp1, d_sess, cnt, since, mark, stamp, asst, true);
     }
-    // close out assists of the last day and reset attribution window
-    let row = (cur_day - day0) as usize * s.ncamp1;
-    for &k in &s.active {
-        s.asst[row + k as usize] += d_sess - s.since[k as usize];
-        s.cnt[k as usize] = 0;
-        s.since[k as usize] = 0;
-    }
-    s.active.clear();
 }
 
 #[inline]
@@ -641,15 +663,17 @@ fn flush_day(
     sessions: u32,
     events: u32,
     revenue: u64,
-    s: &mut Scratch,
+    catsum: &mut [u64],
+    cat_touched: &mut Vec<u16>,
+    u: &mut [pq::ColBuf],
+    urows: &mut usize,
     ctx: &Ctx,
 ) {
-    let top = ctx.pick_top(&s.catsum, &s.cat_touched);
-    for &k in &s.cat_touched {
-        s.catsum[k as usize] = 0;
+    let top = ctx.pick_top(catsum, cat_touched);
+    for &k in cat_touched.iter() {
+        catsum[k as usize] = 0;
     }
-    s.cat_touched.clear();
-    let u = &mut s.ucols;
+    cat_touched.clear();
     u[0].push_str(name);
     u[1].push_i32(day);
     u[2].push_i64(sessions as i64);
@@ -659,5 +683,5 @@ fn flush_day(
         Some(t) => u[5].push_str(&ctx.cat_names[t as usize]),
         None => u[5].push_null(),
     }
-    s.urows += 1;
+    *urows += 1;
 }
