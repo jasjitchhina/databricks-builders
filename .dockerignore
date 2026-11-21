@@ -3,3 +3,7 @@ dev/
 out/
 *.md
 .git
+**/target/
+*.zip
+generator/
+dev-answer/
