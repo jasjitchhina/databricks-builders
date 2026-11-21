@@ -17,6 +17,10 @@ pub trait IdKey: Copy + Eq + Send + Sync + Default + 'static {
     /// Byte-wise `a < b`.
     fn less(a: Self, b: Self) -> bool;
     fn bytes(self) -> Box<[u8]>;
+    /// Appends the ID's bytes to `out` (no allocation for compact keys).
+    fn append_bytes(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes());
+    }
     /// Order-preserving u128 image (for click_id tie-breaks).
     fn click(self) -> u128;
     fn is_long(self) -> bool;
@@ -171,14 +175,18 @@ impl IdKey for u64 {
     }
     fn bytes(self) -> Box<[u8]> {
         let mut v = Vec::with_capacity(10);
+        self.append_bytes(&mut v);
+        v.into()
+    }
+    #[inline]
+    fn append_bytes(self, out: &mut Vec<u8>) {
         for i in 0..10 {
             let code = ((self >> (58 - 6 * i)) & 63) as usize;
             if code == 0 {
                 break;
             }
-            v.push(DECODE[code]);
+            out.push(DECODE[code]);
         }
-        v.into()
     }
     #[inline(always)]
     fn click(self) -> u128 {
@@ -214,6 +222,23 @@ impl<K: IdKey, V: Copy + Default> GMap<K, V> {
                 return Some(s.1);
             }
             i = (i + 1) & self.mask;
+        }
+    }
+    /// Empties the map and makes room for `n` keys without growing
+    /// (reallocates only if the current table is too small).
+    pub fn reset_for(&mut self, n: usize) {
+        let cap = (n * 2).next_power_of_two().max(16);
+        if self.slots.len() < cap {
+            *self = Self::with_capacity(n);
+        } else {
+            self.clear();
+        }
+    }
+    /// Empties the map, keeping its capacity.
+    pub fn clear(&mut self) {
+        if self.len > 0 {
+            self.slots.fill((K::default(), V::default()));
+            self.len = 0;
         }
     }
     /// Returns the existing value, or inserts `v` and returns None.

@@ -204,7 +204,7 @@ pub fn load(data: &Path) -> Cleaned {
     let rank = |b: &[u8]| ids.binary_search(&b).unwrap() as u128;
     let mut parts: Vec<Part> = (0..NPART).map(|_| Part::default()).collect();
     for (g, name) in c.person_names.iter().enumerate() {
-        parts[g % NPART].person_names.push(name.clone());
+        parts[g % NPART].person_names.push(&name[..]);
     }
     for i in 0..c.ev_ts.len() {
         let g = c.ev_person[i] as usize;
