@@ -827,7 +827,8 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 #[inline(always)]
 fn fused_ts() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var_os("FAST_NO_FUSED_TS").is_none())
+    let _ = &F;
+    true
 }
 
 #[inline(always)]
