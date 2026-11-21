@@ -5,7 +5,7 @@
 # --events/--clicks, run main's oracle (ground truth) and main's fast binary (native, NCPU=8, OUT wiped first),
 # compare with scripts/compare.py; every 10th seed also h1's independent xcheck vs oracle.
 # Failures: dataset kept at ~/data/soak/fail-<seed>, note inserted into team.db at once.
-# When main moves: rebuild binary from `git archive main` (offline, vendored), then a no-THP + cold bench of main
+# When main moves: build main's Docker image (the scorer binary, PGO) and run that binary natively, then a no-THP + cold bench of main
 # via bench.sh (exclusive lock, CPUs 0-7), interleaved with the previous landing; note only if either regresses >5%.
 # Everything except bench.sh runs on CPUs $SOAK_CPUS (default 12-15,28-31).
 set -uo pipefail
@@ -28,15 +28,16 @@ next_seed() {  # atomic shared counter
   ( flock -x 8; s=$(cat "$D/next_seed" 2>/dev/null || echo 1000); echo $((s+1)) > "$D/next_seed"; echo "$s" ) 8>"$D/.seed.lock"
 }
 
-build_main() {  # -> $D/bin/<sha>/{fast,oracle/}
-  local sha=$1 src=$D/src-$1
+build_main() {  # -> $D/bin/<sha>/{fast,oracle/}; fast = the SCORER binary (/app/fast from the Dockerfile
+  # image, i.e. PGO + pinned toolchain), not a native cargo build
+  local sha=$1 src=$D/src-$1 cid
   [ -x "$D/bin/$sha/fast" ] && return 0
   rm -rf "$src"; mkdir -p "$src" "$D/bin/$sha"
   git -C "$ROOT" archive "$sha" | tar -x -C "$src"
-  if ! (cd "$src/fast" && taskset -c "$CPUS" cargo build --release --offline --locked --bin fast -q) >"$D/build-$sha.log" 2>&1; then
-    log "BUILD FAIL $sha"; note "SOAK: build of main $sha FAILED natively (cargo --offline --locked): see $D/build-$sha.log"; return 1
+  if ! "$ROOT/bench.sh" -r "$sha" -n 1 dev >"$D/build-$sha.log" 2>&1 || ! cid=$(docker create "bench-rev-$sha:latest" 2>>"$D/build-$sha.log"); then
+    log "BUILD FAIL $sha"; note "SOAK: docker build of main $sha FAILED: see $D/build-$sha.log"; return 1
   fi
-  cp "$src/fast/target/release/fast" "$D/bin/$sha/fast"
+  docker cp "$cid:/app/fast" "$D/bin/$sha/fast" >/dev/null; docker rm "$cid" >/dev/null
   cp -r "$src/oracle" "$src/oracle.sh" "$D/bin/$sha/"
   rm -rf "$src"
 }
