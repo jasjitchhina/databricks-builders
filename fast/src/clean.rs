@@ -443,7 +443,13 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let ev_bytes: usize = maps[..n_ev_files].iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
     let cl_bytes: usize = maps[n_ev_files..].iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
     let ev_est = ev_bytes / 75;
-    let ev_cap = ev_est * 5 / 4 / NB / threads + 64;
+    // dedup buckets: 1024. More buckets speed up dedup at 60M but slow the
+    // parse (more write-combining stages competing for L2); with 2-bit
+    // counters 1024 is as good as 2048 at 60M and best at 20M (HT-like A/B).
+    let nb_bits: u32 = std::env::var("FAST_NB_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(NB_BITS).clamp(6, 14);
+    let nb = 1usize << nb_bits;
+    let nbm = (nb - 1) as u64;
+    let ev_cap = ev_est * 5 / 4 / nb / threads + 64;
     let cl_cap = cl_bytes / 45 * 5 / 4 / NPART / threads + 64;
     let long_click = AtomicBool::new(false);
     let huge = std::env::var_os("FAST_NO_THP").is_none();
@@ -459,8 +465,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
         threads,
         chunks.len(),
         |_| ParseState::<K> {
-            ev: crate::alloc::BlockRegions::new(NB, huge),
-            side: Vec::with_capacity(ev_cap * NB / 20),
+            ev: crate::alloc::BlockRegions::new(nb, huge),
+            side: Vec::with_capacity(ev_cap * nb / 20),
             cl: WcRegions::new_with(NPART, cl_cap, huge),
             cbuf: Vec::new(),
             chash: Vec::new(),
@@ -477,7 +483,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             if c.file < n_ev_files {
                 let mut ok = true;
                 csv::scan_fast::<7, _>(m, c.start, c.end, |f| match parse_event::<K>(m, f, ws, we, base, lk, &mut st.side) {
-                    Ok(Some(r)) => st.ev.push(bucket_of(&r), r),
+                    Ok(Some(r)) => st.ev.push(bucket_of(&r, nbm), r),
                     Ok(None) => {}
                     Err(()) => ok = false,
                 });
@@ -560,7 +566,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let small_cat = small.cat_names.len() <= 256 && std::env::var_os("FAST_SIDE_CAT").is_none();
     let deduped = par_items(
         threads,
-        NB,
+        nb,
         |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u32, u64)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u16)>::new(), Vec::<u64>::new()),
         |(table, surv, cand, out, cnt, pside, hs), b| {
             let _fence = Defer(crate::alloc::sfence);
@@ -572,17 +578,20 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             // Pass 1: count event_id hashes into byte counters (~16 per record,
             // L2-resident). A record whose counter is 1 has a unique event_id
             // in this bucket (copies share the hash), so it skips the table.
+            // 2-bit saturating counters, 4 per byte (0 / 1 / 2+), ~16 slots per record
             let cm = (n * 16).next_power_of_two().max(64);
             let cmask = cm - 1;
             cnt.clear();
-            cnt.resize(cm, 0u8);
+            cnt.resize(cm / 4, 0u8);
             hs.clear();
             for s in states.iter() {
                 s.ev.each(b, |_, r| {
                     let h = r.eid.hash();
                     hs.push(h);
-                    let c = unsafe { cnt.get_unchecked_mut((h >> NB_BITS) as usize & cmask) };
-                    *c += (*c < 2) as u8;
+                    let i = (h >> nb_bits) as usize & cmask;
+                    let c = unsafe { cnt.get_unchecked_mut(i >> 2) };
+                    let sh = (i & 3) * 2;
+                    *c += ((((*c >> sh) & 3) < 2) as u8) << sh;
                 });
             }
             // Pass 2: unique -> survivor (if valid); otherwise a dedup candidate.
@@ -593,7 +602,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                 s.ev.each(b, |ri, r| {
                     let h = unsafe { *hs.get_unchecked(j) };
                     j += 1;
-                    if unsafe { *cnt.get_unchecked((h >> NB_BITS) as usize & cmask) } == 1 {
+                    let i = (h >> nb_bits) as usize & cmask;
+                    if (unsafe { *cnt.get_unchecked(i >> 2) } >> ((i & 3) * 2)) & 3 == 1 {
                         if r.ts != NOT_OK {
                             let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
                             surv.push((r.user, r.user.hash(), r.ts, price, cat));
@@ -614,7 +624,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             table.resize(tcap, 0);
             for &(me, h) in cand.iter() {
                 let tag = h >> 32;
-                let mut i = (h >> NB_BITS) as usize & mask;
+                let mut i = (h >> nb_bits) as usize & mask;
                 let r = get(me);
                 loop {
                     let slot = unsafe { table.get_unchecked_mut(i) };
@@ -913,8 +923,8 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
 }
 
 #[inline(always)]
-fn bucket_of<K: IdKey>(r: &ERec<K>) -> usize {
-    (r.eid.hash() & (NB as u64 - 1)) as usize
+fn bucket_of<K: IdKey>(r: &ERec<K>, nbm: u64) -> usize {
+    (r.eid.hash() & nbm) as usize
 }
 
 /// Single-thread microbenchmark of the event parse path over in-memory files
@@ -1003,7 +1013,7 @@ pub fn microbench(dir: &Path) {
     fn wc<K: IdKey>(m: &[u8], n: usize, ws: i64, we: i64, base: i64, lk: &Lookups, cap: usize, huge: bool) -> u64 {
         let mut side = Vec::new();
         let mut wc = crate::alloc::WcRegions::<ERec<K>, 4>::new_with(NB, cap, huge);
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Ok(Some(r)) = parse_event::<K>(m, f, ws, we, base, lk, &mut side) { wc.push(bucket_of(&r), r) });
+        csv::scan_fast::<7, _>(m, 0, n, |f| if let Ok(Some(r)) = parse_event::<K>(m, f, ws, we, base, lk, &mut side) { wc.push(bucket_of(&r, NB as u64 - 1), r) });
         wc.finish();
         (0..NB).map(|b| wc.len_of(b) as u64).sum()
     }
