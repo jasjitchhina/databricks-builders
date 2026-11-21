@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static M: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static M: fast::alloc::DonorAlloc<mimalloc::MiMalloc> = fast::alloc::DonorAlloc(mimalloc::MiMalloc);
 
 #[cfg(all(feature = "hugealloc", not(feature = "mimalloc")))]
 #[global_allocator]

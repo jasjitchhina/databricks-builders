@@ -99,13 +99,30 @@ unsafe fn civil19_simd(p: *const u8) -> Option<i64> {
     }
     // pairs -> u16: [Y0Y1, Y2Y3, MM, DD, hh, mm, ss, 0]
     let v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
-    let y = _mm_extract_epi16(v, 0) as i64 * 100 + _mm_extract_epi16(v, 1) as i64;
-    let mo = _mm_extract_epi16(v, 2) as i64;
-    let dd = _mm_extract_epi16(v, 3) as i64;
-    let h = _mm_extract_epi16(v, 4) as i64;
-    let mi = _mm_extract_epi16(v, 5) as i64;
-    let s = _mm_extract_epi16(v, 6) as i64;
-    finish_civil(y, mo, dd, h, mi, s)
+    // range checks in one go: MM 1..=12, DD 1..=31, hh <= 23, mm <= 59, ss <= 59
+    let hi = _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0);
+    let lo = _mm_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0);
+    let bad = _mm_or_si128(_mm_cmpgt_epi16(v, hi), _mm_cmpgt_epi16(lo, v));
+    if _mm_movemask_epi8(bad) != 0 {
+        return None;
+    }
+    // fold: [Y0Y1*100 + Y2Y3, MM*32 + DD, hh*3600 + mm*60, ss]
+    let f = _mm_madd_epi16(v, _mm_setr_epi16(100, 1, 32, 1, 3600, 60, 1, 0));
+    let y = _mm_cvtsi128_si32(f) as i64;
+    let md = _mm_extract_epi32(f, 1) as usize;
+    let sod = (_mm_extract_epi32(f, 2) + _mm_extract_epi32(f, 3)) as i64;
+    let (mo, dd) = ((md >> 5) as i64, (md & 31) as i64);
+    let days = if (YMIN..YMIN + YN as i64).contains(&y) {
+        let t = &*TABLES;
+        let i = (y - YMIN) as usize * 12 + mo as usize - 1;
+        if dd > t.mlen[i] as i64 {
+            return None;
+        }
+        t.days[i] as i64 + dd - 1
+    } else {
+        return finish_civil(y, mo, dd, sod / 3600, sod / 60 % 60, sod % 60);
+    };
+    Some((days * 86_400 + sod) * 1000)
 }
 
 #[inline(always)]
