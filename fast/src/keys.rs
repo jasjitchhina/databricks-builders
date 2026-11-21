@@ -368,6 +368,40 @@ impl<K: IdKey> GSharded<K> {
             i = (i + 1) & self.mask;
         }
     }
+    /// Pipeline helpers that compute the filter bits once per key:
+    /// `fbits_h` -> (word, bits); `filter_prefetch_w`; `filter_test_w`;
+    /// `slot_prefetch_h`; `get_slot_h` (no filter re-check).
+    #[inline(always)]
+    pub fn fbits_h(&self, h: u64) -> (usize, u64) {
+        self.fbits(h)
+    }
+    #[inline(always)]
+    pub fn filter_prefetch_w(&self, w: usize) {
+        prefetch(unsafe { self.filter.as_ptr().add(w) } as *const u8);
+    }
+    #[inline(always)]
+    pub fn filter_test_w(&self, w: usize, b: u64) -> bool {
+        unsafe { *self.filter.as_ptr().add(w) & b == b }
+    }
+    #[inline(always)]
+    pub fn slot_prefetch_h(&self, h: u64) {
+        let (base, i) = self.slot_h(h);
+        prefetch(unsafe { base.add(i) } as *const u8);
+    }
+    #[inline(always)]
+    pub fn get_slot_h(&self, k: K, h: u64) -> Option<K> {
+        let (base, mut i) = self.slot_h(h);
+        loop {
+            let e = unsafe { &*base.add(i) };
+            if e.0.is_zero() {
+                return None;
+            }
+            if e.0 == k {
+                return Some(e.1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
     #[inline(always)]
     pub fn prefetch_filter_h(&self, h: u64) {
         let (w, _) = self.fbits(h);

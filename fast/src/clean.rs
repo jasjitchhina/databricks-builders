@@ -651,15 +651,38 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             let _q2 = Instant::now();
             let n = surv.len();
             let _qd = Defer(|| { let q3 = Instant::now(); DD_NS[0].fetch_add((_q1 - _q0).as_nanos() as usize, Ordering::Relaxed); DD_NS[1].fetch_add((_q2 - _q1).as_nanos() as usize, Ordering::Relaxed); DD_NS[2].fetch_add((q3 - _q2).as_nanos() as usize, Ordering::Relaxed); });
+            // 3-stage pipeline: filter word prefetch (j+2PF), filter test + slot
+            // prefetch (j+PF), lookup (j); filter bits computed once per row.
+            const RM: usize = 63;
+            let mut ring = [(0usize, 0u64, false); RM + 1];
+            for j in 0..(2 * PF).min(n) {
+                let (w, bb) = links.fbits_h(unsafe { surv.get_unchecked(j) }.1);
+                links.filter_prefetch_w(w);
+                ring[j & RM] = (w, bb, false);
+            }
+            for j in 0..PF.min(n) {
+                let e = &mut ring[j & RM];
+                e.2 = links.filter_test_w(e.0, e.1);
+                if e.2 {
+                    links.slot_prefetch_h(unsafe { surv.get_unchecked(j) }.1);
+                }
+            }
             for j in 0..n {
                 if j + 2 * PF < n {
-                    links.prefetch_filter_h(unsafe { surv.get_unchecked(j + 2 * PF) }.1);
+                    let (w, bb) = links.fbits_h(unsafe { surv.get_unchecked(j + 2 * PF) }.1);
+                    links.filter_prefetch_w(w);
+                    ring[(j + 2 * PF) & RM] = (w, bb, false);
                 }
                 if j + PF < n {
-                    links.prefetch_if_h(unsafe { surv.get_unchecked(j + PF) }.1);
+                    let e = &mut ring[(j + PF) & RM];
+                    e.2 = links.filter_test_w(e.0, e.1);
+                    if e.2 {
+                        links.slot_prefetch_h(unsafe { surv.get_unchecked(j + PF) }.1);
+                    }
                 }
                 let (user, h, ts, price, cat) = unsafe { *surv.get_unchecked(j) };
-                let (person, ph) = match links.get_h(user, h) {
+                let maybe = ring[j & RM].2;
+                let (person, ph) = match if maybe { links.get_slot_h(user, h) } else { None } {
                     Some(nm) => (nm, nm.hash()),
                     None => (user, h),
                 };
