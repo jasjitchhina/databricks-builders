@@ -65,7 +65,7 @@ cleanup() {
   [ -n "${CID:-}" ] && docker rm -f "$CID" >/dev/null 2>&1 || true
   if [ -d "$WORK" ]; then
     # files written by uid 1000 may not be ours; fix perms via a throwaway container
-    docker run --rm --network none --user 1000:1000 -v "$WORK":/w --entrypoint chmod "$IMAGE" -R a+rwX /w >/dev/null 2>&1 || true
+    docker run --rm --network none --user 0:0 -v "$WORK":/w --entrypoint chmod "${HELPER_IMAGE:-python:3.12-slim-bookworm}" -R a+rwX /w >/dev/null 2>&1 || true
     rm -rf "$WORK" 2>/dev/null || true
   fi
 }

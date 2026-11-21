@@ -14,3 +14,4 @@ team.db*
 !fixtures/**/*.csv
 !dev-answer/*.csv
 fast/target/
+__pycache__/

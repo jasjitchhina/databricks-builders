@@ -17,8 +17,8 @@ else
   chmod 777 "$OUT" "$SCRATCH"
   release() {
     if [ -n "$(find "$OUT" "$SCRATCH" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
-      docker run --rm --network none --user 1000:1000 -v "$OUT":/output -v "$SCRATCH":/scratch \
-        --entrypoint chmod "$TARGET" -R a+rwX /output /scratch >/dev/null 2>&1 || true
+      docker run --rm --network none --user 0:0 -v "$OUT":/output -v "$SCRATCH":/scratch \
+        --entrypoint chmod "${HELPER_IMAGE:-python:3.12-slim-bookworm}" -R a+rwX /output /scratch >/dev/null 2>&1 || true
     fi
     rm -rf "$SCRATCH" 2>/dev/null || true
   }

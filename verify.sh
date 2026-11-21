@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify.sh: correctness gate. Nothing merges to main unless this exits 0.
 #
-#   ./verify.sh [TARGET]
+#   ./verify.sh [TARGET]        or   ./verify.sh -r GITREV   (builds that commit from git archive)
 #
 # TARGET: an executable (run natively, gets DATA_DIR/OUTPUT_DIR/SCRATCH_DIR env and args DATA OUT)
 #         or a docker image tag. Default: build the repo-root Dockerfile as verify-<worktree>:latest.
@@ -18,7 +18,18 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 DATA_ROOT=${DATA_ROOT:-$HOME/data}
 export PYTHONPATH=$HOME/pylib${PYTHONPATH:+:$PYTHONPATH}
 TARGET=${1:-}
-if [ -z "$TARGET" ]; then
+REV=HEAD
+COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)
+if [ "$TARGET" = "-r" ]; then
+  REV=${2:?usage: verify.sh -r GITREV}
+  COMMIT=$(git -C "$ROOT" rev-parse --short "$REV^{commit}") || exit 1
+  CTX=$(mktemp -d "$DATA_ROOT/scratch/verifyctx.XXXXXX")
+  git -C "$ROOT" archive "$COMMIT" | tar -x -C "$CTX"
+  TARGET="verify-rev-$COMMIT:latest"
+  echo "== building $TARGET from $REV ($COMMIT)" >&2
+  flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
+  rm -rf "$CTX"
+elif [ -z "$TARGET" ]; then
   TARGET="verify-$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.\n-' '-'):latest"
   echo "== building $TARGET" >&2
   flock -s /tmp/bench.lock docker build -q --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
@@ -30,14 +41,13 @@ RUN="$ROOT/harness/run_target.sh"
 WORK=$(mktemp -d "$DATA_ROOT/scratch/verify.XXXXXX" 2>/dev/null || { mkdir -p "$DATA_ROOT/scratch"; mktemp -d "$DATA_ROOT/scratch/verify.XXXXXX"; })
 trap 'rm -rf "$WORK" 2>/dev/null' EXIT
 FAILS=()
-COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)
 
-echo "== [0] lint"
-LINT=$(git -C "$ROOT" grep -nIE 'target-cpu *= *native|target-cpu=native|-march=native|avx512' -- ':!verify.sh' ':!*.md' 2>/dev/null || true)
+echo "== [0] lint ($REV)"
+LINT=$(git -C "$ROOT" grep -nIE 'target-cpu *= *native|target-cpu=native|-march=native|avx512' "$REV" -- ':!verify.sh' ':!*.md' 2>/dev/null || true)
 if [ -n "$LINT" ]; then echo "FAIL lint: native/avx512 codegen flags found:"; echo "$LINT"; FAILS+=(lint-native); fi
-SIZE_KB=$(git -C "$ROOT" ls-files -z | (cd "$ROOT" && xargs -0 du -ck 2>/dev/null) | tail -1 | cut -f1)
+SIZE_KB=$(git -C "$ROOT" ls-tree -r -l "$REV" | awk '{s+=$4} END{printf "%d", s/1024}')
 if [ "${SIZE_KB:-0}" -gt 45000 ]; then echo "FAIL lint: tracked files ${SIZE_KB} KB (limit 50 MB)"; FAILS+=(lint-size); fi
-BIG=$(git -C "$ROOT" ls-files | grep -E '\.(parquet|csv)$' | grep -vE '^(fixtures|dev-answer)/' || true)
+BIG=$(git -C "$ROOT" ls-tree -r --name-only "$REV" | grep -E '\.(parquet|csv)$' | grep -vE '^(fixtures|dev-answer)/' || true)
 if [ -n "$BIG" ]; then echo "FAIL lint: data files tracked: $BIG"; FAILS+=(lint-data); fi
 [ ${#FAILS[@]} -eq 0 ] && echo "ok   lint (tracked ${SIZE_KB} KB)"
 
