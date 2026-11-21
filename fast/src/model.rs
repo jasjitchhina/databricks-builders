@@ -62,10 +62,54 @@ impl<T> Rows<T> {
     }
 }
 
+/// Person names of a part in one buffer (one allocation instead of one per
+/// person). `names[i]` is the i-th name's bytes.
+#[derive(Default)]
+pub struct Names {
+    buf: Vec<u8>,
+    end: Vec<u32>,
+}
+
+impl Names {
+    pub fn with_capacity(n: usize, bytes: usize) -> Self {
+        Names { buf: Vec::with_capacity(bytes), end: Vec::with_capacity(n) }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.end.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.end.is_empty()
+    }
+    pub fn push(&mut self, name: impl AsRef<[u8]>) {
+        self.buf.extend_from_slice(name.as_ref());
+        self.end.push(self.buf.len() as u32);
+    }
+    /// Appends a name written by `f` into the buffer.
+    #[inline]
+    pub fn push_with(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+        f(&mut self.buf);
+        self.end.push(self.buf.len() as u32);
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        (0..self.len()).map(move |i| &self[i])
+    }
+}
+
+impl std::ops::Index<usize> for Names {
+    type Output = [u8];
+    #[inline]
+    fn index(&self, i: usize) -> &[u8] {
+        let s = if i == 0 { 0 } else { self.end[i - 1] as usize };
+        &self.buf[s..self.end[i] as usize]
+    }
+}
+
 #[derive(Default)]
 pub struct Part {
     /// part-local person index -> person name (byte-wise smallest linked ID).
-    pub person_names: Vec<Box<[u8]>>,
+    pub person_names: Names,
     /// surviving events (after dedup, validation, late drop), unsorted.
     pub ev: Rows<Ev>,
     /// valid clicks (not deduped: copies are identical), unsorted. Only clicks

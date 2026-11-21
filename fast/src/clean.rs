@@ -155,6 +155,9 @@ fn links_stage1<K: IdKey>(dir: &Path, threads: usize) -> Option<LinkPre<K>> {
     let maps: Vec<Option<Mmap>> = files.iter().map(|p| csv::map(p)).collect();
     let chunks = csv::chunks(&maps, 1 << 20);
     let bad = AtomicBool::new(false);
+    // ~20 bytes per link line, 2 endpoints each: presize the shard buckets
+    let link_bytes: usize = maps.iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
+    let shard_cap = link_bytes / 20 * 2 * 5 / 4 / threads.max(1) / LS + 8;
     // per thread: endpoints in order (pair j = endpoints 2j, 2j+1), bucketed by shard as (key, endpoint ref)
     struct LS_<K> {
         n_ep: u32,
@@ -164,7 +167,7 @@ fn links_stage1<K: IdKey>(dir: &Path, threads: usize) -> Option<LinkPre<K>> {
     let per = par_items(
         threads,
         chunks.len(),
-        |t| LS_::<K> { n_ep: 0, t: t as u32, shards: (0..LS).map(|_| Vec::new()).collect() },
+        |t| LS_::<K> { n_ep: 0, t: t as u32, shards: (0..LS).map(|_| Vec::with_capacity(shard_cap)).collect() },
         |st, i| {
             if bad.load(Ordering::Relaxed) {
                 return;
@@ -205,9 +208,9 @@ fn links_stage1<K: IdKey>(dir: &Path, threads: usize) -> Option<LinkPre<K>> {
     };
     // per shard: intern -> local ids, keys
     let shard_keys: Vec<Mutex<Vec<K>>> = (0..LS).map(|_| Mutex::new(Vec::new())).collect();
-    par_items(threads, LS, |_| (), |_, s| {
+    par_items(threads, LS, |_| GMap::<K, u32>::with_capacity(0), |tab, s| {
         let n: usize = per_by_t.iter().map(|p| p.shards[s].len()).sum();
-        let mut tab: GMap<K, u32> = GMap::with_capacity(n);
+        tab.reset_for(n);
         let mut keys = Vec::with_capacity(n / 2 + 1);
         for p in &per_by_t {
             for &(k, r) in &p.shards[s] {
@@ -700,11 +703,11 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
         par_items(threads, NPART, |t| {
             // recycle this thread's dead event-bucket buffer (dedup is done with it)
             let (b, l) = states[t.min(states.len() - 1)].ev.raw();
-            unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }
-        }, |bump, p| {
+            (unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }, GMap::<K, u32>::with_capacity(4096), Vec::<K>::new())
+        }, |(bump, local, names), p| {
             let n: usize = deduped.iter().map(|(_, _, _, o, _, _)| o.len_of(p)).sum();
-            let mut local: GMap<K, u32> = GMap::with_capacity(1024);
-            let mut names: Vec<K> = Vec::new();
+            local.clear();
+            names.clear();
             let mut ev_vec: Vec<Ev> = Vec::new();
             let ev_ptr: *mut Ev = match bump.take::<Ev>(n) {
                 Some(q) => q,
@@ -765,7 +768,10 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                 bump.shrink_last(cl_ptr, nc);
                 Rows::Static(unsafe { std::slice::from_raw_parts_mut(cl_ptr, nc) })
             };
-            let person_names = names.into_iter().map(|k| k.bytes()).collect();
+            let mut person_names = crate::model::Names::with_capacity(names.len(), names.len() * 10);
+            for &k in names.iter() {
+                person_names.push_with(|b| k.append_bytes(b));
+            }
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
         });
     }
