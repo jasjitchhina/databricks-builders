@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-#[cfg(feature = "hugealloc")]
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static M: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "hugealloc", not(feature = "mimalloc")))]
 #[global_allocator]
 static A: fast::alloc::HugeAlloc = fast::alloc::HugeAlloc;
 use std::time::Instant;
