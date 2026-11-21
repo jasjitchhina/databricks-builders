@@ -9,7 +9,11 @@ fn main() {
     let mut v = vec![vec![]; nv as usize];
     for _ in 0..n {
         for var in 0..nv {
-            fast::engine::VARIANT.store(var, std::sync::atomic::Ordering::Relaxed);
+            let radix_mode = std::env::var_os("ABRADIX").is_some();
+            fast::engine::VARIANT.store(if radix_mode { 0 } else { var }, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(r) = std::env::var(format!("RADIX_MIN{var}")) {
+                fast::engine::RADIX_MIN.store(r.parse().unwrap(), std::sync::atomic::Ordering::Relaxed);
+            }
             let t = std::time::Instant::now();
             let o = fast::engine::run(&c, false, None);
             v[var as usize].push(t.elapsed().as_secs_f64() * 1e3);

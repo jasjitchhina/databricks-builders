@@ -19,6 +19,9 @@ fn main() {
     let dump = std::env::var("DUMP_DIR").ok().map(PathBuf::from);
     let verbose = std::env::var("FAST_TIMING").is_ok();
     let t0 = Instant::now();
+    if std::env::var_os("FAST_NO_PREFETCH").is_none() {
+        prefetch_inputs(&data);
+    }
     let c = if std::env::var("FAST_TEMP_LOADER").is_ok() { fast::loader::load(&data) } else { fast::clean::clean(&data, nthreads) };
     let t1 = Instant::now();
     let (ud, cd) = fast::writer::prepare_dirs(&out);
@@ -68,4 +71,41 @@ fn main() {
     }
     // Skip destructors: freeing millions of small allocations at exit is pure waste.
     std::process::exit(0);
+}
+
+/// Cold page cache insurance: ask the kernel to start reading every input file now
+/// (POSIX_FADV_WILLNEED, async readahead) from a background thread, in the order the
+/// pipeline consumes them (links, clicks, events). Nearly free when the cache is warm.
+fn prefetch_inputs(data: &std::path::Path) {
+    let mut files = vec![];
+    for sub in ["links", "clicks", "events"] {
+        let mut v: Vec<_> = std::fs::read_dir(data.join(sub))
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        v.sort();
+        files.extend(v);
+    }
+    // several threads keep the device queue deep; each opens, advises (8MB ranges) and
+    // closes one file at a time so at most `nt` descriptors are ever held (EMFILE-safe)
+    let nt: usize = std::env::var("FAST_PF_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let files = std::sync::Arc::new(files);
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..nt {
+        let (files, next) = (files.clone(), next.clone());
+        std::thread::spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(p) = files.get(i) else { break };
+                let Ok(f) = std::fs::File::open(p) else { continue };
+                let len = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                let mut o = 0;
+                while o < len {
+                    let l = (8i64 << 20).min(len - o);
+                    unsafe { libc::posix_fadvise(f.as_raw_fd(), o, l, libc::POSIX_FADV_WILLNEED) };
+                    o += l;
+                }
+            }
+        });
+    }
 }
