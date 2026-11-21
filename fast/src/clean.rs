@@ -789,6 +789,31 @@ pub fn microbench(dir: &Path) {
         csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64));
         x
     });
+    run("scan+ts_in", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64 ^ parse_ts_in(m, f[3]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+ing", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[3]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+tsonly", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+ts+pk", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64 ^ parse_ts_in(m, f[3]).unwrap_or(0) as u64 ^ <u64 as IdKey>::pack(m, f[0]).unwrap_or(0) ^ <u64 as IdKey>::pack(m, f[1]).unwrap_or(0)));
+        x
+    });
+    run("scan+typ", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| x += match f[4] { b"view" | b"cart" => 1, b"purchase" => 2, _ => 3 });
+        x
+    });
     fn noout<K: IdKey>(m: &[u8], n: usize, ws: i64, we: i64, base: i64, lk: &Lookups) -> u64 {
         let mut side = Vec::new();
         let mut x = 0u64;
