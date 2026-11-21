@@ -140,6 +140,13 @@ print('%.3f'%(p('$F')-p('$S')))")
     WALL=$(awk "BEGIN{printf \"%.3f\", $T1-$T0}")
     docker logs "$CID" > "$WORK/log.txt" 2>&1 || true
     if [ "${BENCH_SHOW_LOG:-0}" = 1 ]; then sed "s/^/  [$NAME r$r] /" "$WORK/log.txt" >&2; fi
+    # FAST_TIMING logs end_epoch_ns just before the exit path: report the exit tail (zap + kernel teardown)
+    if EE=$(grep -aoE 'end_epoch_ns [0-9]+' "$WORK/log.txt" | awk '{print $2}') && [ -n "$EE" ]; then
+      python3 -c "
+from datetime import datetime
+s='$F'.rstrip('Z'); a,b=(s.split('.')+['0'])[:2]; f=datetime.fromisoformat(a).timestamp()+float('0.'+b[:9])
+print('  [$NAME r$r] exit tail %.1f ms (end_epoch_ns -> FinishedAt)' % ((f - $EE/1e9)*1e3))" >&2
+    fi
     docker rm "$CID" >/dev/null; CID=""
     PGB=$(awk "BEGIN{printf \"%.2f\", $PEAK/1073741824}")
     echo "$NAME run $r: container ${CT}s (docker-run wall ${WALL}s) peak ${PGB} GB exit $EXIT oom $OOM" >&2

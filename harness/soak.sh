@@ -6,7 +6,7 @@
 # compare with scripts/compare.py; every 10th seed also h1's independent xcheck vs oracle.
 # Failures: dataset kept at ~/data/soak/fail-<seed>, note inserted into team.db at once.
 # When main moves: rebuild binary from `git archive main` (offline, vendored), then a no-THP + cold bench of main
-# via bench.sh (exclusive lock, CPUs 0-7); a note is posted only if either regresses >5% vs the previous landing.
+# via bench.sh (exclusive lock, CPUs 0-7), interleaved with the previous landing; note only if either regresses >5%.
 # Everything except bench.sh runs on CPUs $SOAK_CPUS (default 12-15,28-31).
 set -uo pipefail
 H=$(cd "$(dirname "$0")" && pwd); ROOT=${SOAK_ROOT:-$(dirname "$H")}
@@ -41,17 +41,28 @@ build_main() {  # -> $D/bin/<sha>/{fast,oracle/}
   rm -rf "$src"
 }
 
-bench_landing() {  # no-THP + cold bench of main $1 (20M), compare with previous landing
-  local sha=$1 out prev
-  out=$("$H/nothp_ab.sh" "$sha" 2>/dev/null | grep -E '^nothp-.* cpus=0-7 ' | grep -oE 'median=[0-9.]+' | cut -d= -f2)
-  local cold; cold=$("$ROOT/bench.sh" -r "$sha" --no-build --cold -n 3 s7-20m 2>/dev/null | grep RESULT | grep -oE 'median=[0-9.]+' | cut -d= -f2)
-  log "landing $sha: noTHP 20M ${out:-?}s cold 20M ${cold:-?}s"
-  if [ -f "$D/landing.last" ]; then
-    read -r psha pnothp pcold < "$D/landing.last"
-    awk -v a="${out:-0}" -v b="$pnothp" -v c="${cold:-0}" -v d="$pcold" 'BEGIN{exit !((b>0 && a>b*1.05) || (d>0 && c>d*1.05))}' && \
-      note "SOAK REGRESSION >5% main $sha vs $psha: no-THP 20M (cpus 0-7) ${out}s vs ${pnothp}s; cold 20M ${cold}s vs ${pcold}s (bench.sh medians of 3)."
+bench_landing() {  # no-THP + cold bench of main $1 vs the previous landing, INTERLEAVED in the same window
+  # (stored baselines drift with machine load: a 10% false alarm came from comparing against a quieter hour)
+  local sha=$1 psha="" a b c d
+  [ -f "$D/landing.last" ] && read -r psha _ < "$D/landing.last"
+  med() { "$ROOT/bench.sh" "$@" 2>/dev/null | grep RESULT | grep -oE 'median=[0-9.]+' | cut -d= -f2; }
+  "$H/mknothp.sh" "$sha" >/dev/null 2>&1 || true   # builds bench-rev-/nothp- images
+  [ -n "$psha" ] && [ "$psha" != "$sha" ] && { "$H/mknothp.sh" "$psha" >/dev/null 2>&1 || true; }
+  if [ -n "$psha" ] && [ "$psha" != "$sha" ]; then
+    local an=0 bn=0 ac=0 bc=0
+    for round in 1 2; do
+      a=$(med -i "nothp-$psha:latest" -n 3 s7-20m); b=$(med -i "nothp-$sha:latest" -n 3 s7-20m)
+      c=$(med -r "$psha" --no-build --cold -n 1 s7-20m); d=$(med -r "$sha" --no-build --cold -n 1 s7-20m)
+      an=$(awk -v x="$an" -v y="${a:-0}" 'BEGIN{print x+y}'); bn=$(awk -v x="$bn" -v y="${b:-0}" 'BEGIN{print x+y}')
+      ac=$(awk -v x="$ac" -v y="${c:-0}" 'BEGIN{print x+y}'); bc=$(awk -v x="$bc" -v y="${d:-0}" 'BEGIN{print x+y}')
+    done
+    log "landing $sha vs $psha (interleaved, sums of 2 medians): noTHP $bn vs $an; cold $bc vs $ac"
+    awk -v a="$an" -v b="$bn" -v c="$ac" -v d="$bc" 'BEGIN{exit !((a>0 && b>a*1.05) || (c>0 && d>c*1.05))}' && \
+      note "SOAK REGRESSION >5% main $sha vs $psha, benched INTERLEAVED in the same window (2 rounds): no-THP 20M cpus 0-7 sum of medians ${bn}s vs ${an}s; cold 20M ${bc}s vs ${ac}s."
+  else
+    log "landing $sha: baseline set"
   fi
-  echo "$sha ${out:-0} ${cold:-0}" > "$D/landing.last"
+  echo "$sha" > "$D/landing.last"
 }
 
 one_seed() {  # one_seed SEED SHA
