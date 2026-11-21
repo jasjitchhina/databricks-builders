@@ -1,3 +1,4 @@
+pub mod alloc;
 pub mod clean;
 pub mod csv;
 pub mod ids;
