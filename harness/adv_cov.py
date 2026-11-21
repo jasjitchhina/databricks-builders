@@ -7,6 +7,8 @@ each built to drive a fallback path of fast/ that generator-shaped data never re
              (> 4095 campaigns => engine generic path; campaign idx > u12)
   longwindow manifest window stretched to 30 days (ts span > 2^31 ms rel. to window_start-7d =>
              engine generic path), boundary rows move inside the window
+  offwindow  window_start/end shifted by +10h37m13s (not midnight-aligned): UTC day of a session
+             start no longer lines up with window-relative day offsets
   bigperson  one user gets 2.3M extra valid clicks (one part with >= 2^21 clicks => per-part generic
              path) plus 3000 events spread over the window (huge radix-sorted person)
 All rows stay valid CSV per rules.md; correctness is judged by the oracle, so no guarantees are assumed.
@@ -80,6 +82,13 @@ for mode in MODES:
         mp = os.path.join(dst, 'manifest.json')
         m = json.load(open(mp))
         m['window_end'] = iso(ms(m['window_start']) + 30 * 86400000)
+        json.dump(m, open(mp, 'w'))
+    elif mode == 'offwindow':
+        mp = os.path.join(dst, 'manifest.json')
+        m = json.load(open(mp))
+        sh = (10 * 3600 + 37 * 60 + 13) * 1000
+        m['window_start'] = iso(ms(m['window_start']) + sh)
+        m['window_end'] = iso(ms(m['window_end']) + sh)
         json.dump(m, open(mp, 'w'))
     elif mode == 'bigperson':
         m = json.load(open(os.path.join(dst, 'manifest.json')))
