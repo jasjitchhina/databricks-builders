@@ -8,7 +8,7 @@
 # Checks, in order (all run; exit 1 if any fails):
 #   1. all fixtures/                      (expected CSVs, scripts/run_fixtures.py)
 #   2. check-dev                          (~/data/dev vs dev-answer/)
-#   3. row-exact diff vs the oracle cache (~/data/oracle/<ds>/) on $VERIFY_SETS
+#   3. row-exact diff vs the oracle cache (~/data/oracle/<ds>/out/, h1's layout) on $VERIFY_SETS
 #      default: s2-1m s3-1m s15-1m-feb29 + every ~/data/adv-* + s7-20m (20M)
 # Env: QUICK=1 skips the 20M set. VERIFY_SETS="a b" overrides the oracle sets.
 #      ALLOW_MISSING_ORACLE=1 skips (instead of failing) sets with no oracle answer yet.
@@ -66,8 +66,8 @@ else
 fi
 echo "== [3] oracle diffs: ${SETS[*]}"
 for ds in "${SETS[@]}"; do
-  ans="$DATA_ROOT/oracle/$ds"
-  if [ ! -f "$ans/DONE" ]; then
+  ans="$DATA_ROOT/oracle/$ds/out"
+  if ! ls "$ans"/user_daily/*.parquet "$ans"/campaign_daily/*.parquet >/dev/null 2>&1; then
     if [ "${ALLOW_MISSING_ORACLE:-0}" = 1 ]; then echo "skip $ds: no oracle answer"; continue; fi
     echo "FAIL $ds: no oracle answer at $ans (run harness/oracle_cache.sh $ds)"; FAILS+=("$ds:no-oracle"); continue
   fi

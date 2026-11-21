@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# oracle_cache.sh [--force] DATASET...  — writes the oracle's answer for ~/data/DATASET to ~/data/oracle/DATASET/
+# oracle_cache.sh [--force] DATASET...  — writes the oracle's answer for ~/data/DATASET to ~/data/oracle/DATASET/{out,dump}/ (h1's layout), atomically via .tmp + mv
 # ORACLE (default /home/jessechhina/wt/h1/oracle.sh) is called as: ORACLE DATA_DIR OUT_DIR.
 # Refuses unless the oracle first reproduces dev-answer exactly (checked once per oracle commit).
 set -euo pipefail
@@ -19,10 +19,10 @@ if [ ! -f "$OK" ]; then
 fi
 for ds in "$@"; do
   dst="$DATA_ROOT/oracle/$ds"
-  if [ -f "$dst/DONE" ] && [ $FORCE = 0 ]; then echo "have $ds ($(cat "$dst/DONE"))"; continue; fi
-  rm -rf "$dst.tmp" "$dst"; mkdir -p "$dst.tmp"
+  if [ -d "$dst/out/user_daily" ] && [ $FORCE = 0 ]; then echo "have $ds ($(cat "$dst/DONE" 2>/dev/null))"; continue; fi
+  rm -rf "$dst.tmp" "$dst"; mkdir -p "$dst.tmp/out" "$dst.tmp/dump"
   s=$(date +%s)
-  "$ORACLE" "$DATA_ROOT/$ds" "$dst.tmp" >&2
+  DUMP_DIR="$dst.tmp/dump" "$ORACLE" "$DATA_ROOT/$ds" "$dst.tmp/out" >&2
   echo "oracle=$OC secs=$(( $(date +%s)-s )) when=$(date -Is)" > "$dst.tmp/DONE"
   mv "$dst.tmp" "$dst"
   echo "made $ds ($(cat "$dst/DONE"))"

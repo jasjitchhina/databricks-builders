@@ -8,7 +8,7 @@
 # and runs the image with the scorer's limits RUNS times (default 3) per dataset.
 # Reports per-run container wall time (docker StartedAt->FinishedAt, the scorer's clock),
 # docker-run wall time, peak cgroup memory (memory.peak, polled every 20 ms), and the median.
-# If an oracle answer exists at ~/data/oracle/<dataset>/ the first run's output is diffed against it.
+# If an oracle answer exists at ~/data/oracle/<dataset>/out/ the first run's output is diffed against it.
 # Results are appended to ~/data/bench/results.tsv.
 set -euo pipefail
 
@@ -115,8 +115,8 @@ print('%.3f'%(p('$F')-p('$S')))")
       exit 1
     fi
     TIMES+=("$CT"); PEAKS+=("$PGB")
-    if [ "$r" = 1 ] && [ -d "$DATA_ROOT/oracle/$NAME" ]; then
-      if PYTHONPATH=$HOME/pylib python3 "$ROOT/scripts/compare.py" "$WORK/out" "$DATA_ROOT/oracle/$NAME" > "$WORK/cmp.txt" 2>&1; then CHECK=MATCH; else CHECK=DIFFER; cat "$WORK/cmp.txt" >&2; fi
+    if [ "$r" = 1 ] && [ -d "$DATA_ROOT/oracle/$NAME/out/user_daily" ]; then
+      if PYTHONPATH=$HOME/pylib python3 "$ROOT/scripts/compare.py" "$WORK/out" "$DATA_ROOT/oracle/$NAME/out" > "$WORK/cmp.txt" 2>&1; then CHECK=MATCH; else CHECK=DIFFER; cat "$WORK/cmp.txt" >&2; fi
       echo "$NAME check vs oracle: $CHECK" >&2
     fi
   done
