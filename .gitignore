@@ -13,3 +13,4 @@ team.db*
 *.csv
 !fixtures/**/*.csv
 !dev-answer/*.csv
+fast/target/
