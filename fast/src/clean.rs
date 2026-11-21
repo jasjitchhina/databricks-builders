@@ -23,6 +23,7 @@ impl<F: FnMut()> Drop for Defer<F> {
     }
 }
 const NB_BITS: u32 = 10;
+const CM_PER: usize = 8; // 2-bit counter slots per record in a dedup bucket
 const NB: usize = 1 << NB_BITS; // dedup buckets
 const CHUNK: usize = 2 << 20;
 const MAX_PRICE: u64 = 10_000_000;
@@ -568,7 +569,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let deduped = par_items(
         threads,
         nb,
-        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u32, u64)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u16)>::new(), Vec::<u64>::new()),
+        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u64, u32, ERec<K>)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u16)>::new(), Vec::<u64>::new()),
         |(table, surv, cand, out, cnt, pside, hs), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
@@ -580,7 +581,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             // L2-resident). A record whose counter is 1 has a unique event_id
             // in this bucket (copies share the hash), so it skips the table.
             // 2-bit saturating counters, 4 per byte (0 / 1 / 2+), ~16 slots per record
-            let cm = (n * 16).next_power_of_two().max(64);
+            let cm = (n * CM_PER).next_power_of_two().max(64);
             let cmask = cm - 1;
             cnt.clear();
             cnt.resize(cm / 4, 0u8);
@@ -600,7 +601,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             cand.clear();
             let mut j = 0usize;
             for (ti, s) in states.iter().enumerate() {
-                s.ev.each(b, |ri, r| {
+                s.ev.each(b, |_ri, r| {
                     let h = unsafe { *hs.get_unchecked(j) };
                     j += 1;
                     let i = (h >> nb_bits) as usize & cmask;
@@ -610,7 +611,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                             surv.push((r.user, r.user.hash(), r.ts, price, cat));
                         }
                     } else {
-                        cand.push((((ti as u32) << 26) | ri as u32, h));
+                        cand.push((h, ti as u32, *r));
                     }
                 });
             }
@@ -618,27 +619,26 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             // Pass 3: exact dedup among candidates (true copies + counter
             // collisions): keep the smallest ingest_ts; equal ingest_ts copies
             // are identical, the first one stays.
-            let get = |r: u32| -> &ERec<K> { unsafe { states.get_unchecked((r >> 26) as usize) }.ev.at(b, (r & ((1 << 26) - 1)) as usize) };
+            // (candidates carry a copy of their record: no random re-fetch)
             let tcap = (cand.len() * 2).next_power_of_two().max(16);
             let mask = tcap - 1;
             table.clear();
             table.resize(tcap, 0);
-            for &(me, h) in cand.iter() {
+            for (ci, (h, _, r)) in cand.iter().enumerate() {
                 let tag = h >> 32;
                 let mut i = (h >> nb_bits) as usize & mask;
-                let r = get(me);
                 loop {
                     let slot = unsafe { table.get_unchecked_mut(i) };
                     if *slot == 0 {
-                        *slot = (tag << 32) | (me as u64 + 1);
+                        *slot = (tag << 32) | (ci as u64 + 1);
                         break;
                     }
                     if (*slot >> 32) == tag {
-                        let o = (*slot as u32).wrapping_sub(1);
-                        let old = get(o);
+                        let o = (*slot as u32).wrapping_sub(1) as usize;
+                        let old = unsafe { &cand.get_unchecked(o).2 };
                         if old.eid == r.eid {
                             if r.ingest < old.ingest {
-                                *slot = (tag << 32) | (me as u64 + 1);
+                                *slot = (tag << 32) | (ci as u64 + 1);
                             }
                             break;
                         }
@@ -650,12 +650,11 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                 if e == 0 {
                     continue;
                 }
-                let o = (e as u32).wrapping_sub(1);
-                let r = get(o);
+                let (_, ti, r) = unsafe { cand.get_unchecked((e as u32).wrapping_sub(1) as usize) };
                 if r.ts == NOT_OK {
                     continue;
                 }
-                let s = unsafe { states.get_unchecked((o >> 26) as usize) };
+                let s = unsafe { states.get_unchecked(*ti as usize) };
                 let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
                 surv.push((r.user, r.user.hash(), r.ts, price, cat));
             }
