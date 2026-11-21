@@ -561,8 +561,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let deduped = par_items(
         threads,
         NB,
-        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u32, u64)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u16)>::new()),
-        |(table, surv, cand, out, cnt, pside), b| {
+        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u32, u64)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u16)>::new(), Vec::<u64>::new()),
+        |(table, surv, cand, out, cnt, pside, hs), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
             if n == 0 {
@@ -576,18 +576,23 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             let cmask = cm - 1;
             cnt.clear();
             cnt.resize(cm, 0u8);
+            hs.clear();
             for s in states.iter() {
                 s.ev.each(b, |_, r| {
-                    let c = unsafe { cnt.get_unchecked_mut((r.eid.hash() >> NB_BITS) as usize & cmask) };
+                    let h = r.eid.hash();
+                    hs.push(h);
+                    let c = unsafe { cnt.get_unchecked_mut((h >> NB_BITS) as usize & cmask) };
                     *c += (*c < 2) as u8;
                 });
             }
             // Pass 2: unique -> survivor (if valid); otherwise a dedup candidate.
             surv.clear();
             cand.clear();
+            let mut j = 0usize;
             for (ti, s) in states.iter().enumerate() {
                 s.ev.each(b, |ri, r| {
-                    let h = r.eid.hash();
+                    let h = unsafe { *hs.get_unchecked(j) };
+                    j += 1;
                     if unsafe { *cnt.get_unchecked((h >> NB_BITS) as usize & cmask) } == 1 {
                         if r.ts != NOT_OK {
                             let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
@@ -688,7 +693,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             let (b, l) = states[t.min(states.len() - 1)].ev.raw();
             (unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }, GMap::<K, u32>::with_capacity(4096), Vec::<K>::new())
         }, |(bump, local, names), p| {
-            let n: usize = deduped.iter().map(|(_, _, _, o, _, _)| o.len_of(p)).sum();
+            let n: usize = deduped.iter().map(|(_, _, _, o, _, _, _)| o.len_of(p)).sum();
             local.clear();
             names.clear();
             let mut ev_vec: Vec<Ev> = Vec::new();
@@ -700,7 +705,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                 }
             };
             let mut ne = 0usize;
-            for (_, _, _, o, _, pside) in deduped.iter() {
+            for (_, _, _, o, _, pside, _) in deduped.iter() {
                 o.each(p, |_, r| {
                     let id = match local.get_or_insert(r.person, names.len() as u32) {
                         Some(v) => v,
