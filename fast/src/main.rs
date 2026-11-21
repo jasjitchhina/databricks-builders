@@ -73,6 +73,7 @@ fn main() {
     // allocations is pure waste) and pre-clear page tables in parallel so the
     // single-threaded exit teardown has little left to do.
     if std::env::var_os("FAST_NO_ZAP").is_none() {
+        cov_flush();
         zap_and_exit(&data, nthreads, std::env::var_os("FAST_NO_ZAP_ANON").is_none(), verbose);
     }
     std::process::exit(0);
@@ -227,3 +228,16 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     }
     unsafe { libc::_exit(0) }
 }
+
+/// Coverage builds (feature "cov", -C instrument-coverage): write the profile
+/// before _exit skips the runtime's atexit writer.
+#[cfg(feature = "cov")]
+fn cov_flush() {
+    extern "C" {
+        fn __llvm_profile_write_file() -> i32;
+    }
+    unsafe { __llvm_profile_write_file() };
+}
+#[cfg(not(feature = "cov"))]
+#[inline(always)]
+fn cov_flush() {}
