@@ -352,6 +352,8 @@ pub fn click_id_bytes(k: u128) -> Box<[u8]> {
 }
 
 pub fn clean(dir: &Path, threads: usize) -> Cleaned {
+    // record refs pack the worker index: links use 5 bits (t << 27), dedup 6 (t << 26)
+    let threads = threads.clamp(1, 31);
     // products/campaigns/manifest load on a side thread while links stage 1 runs
     let small_cell: std::sync::OnceLock<Small> = std::sync::OnceLock::new();
     std::thread::scope(|sc| {
