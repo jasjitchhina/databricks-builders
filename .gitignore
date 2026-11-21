@@ -1,0 +1,15 @@
+# generated data and build output (never commit data)
+dev/
+data/
+out/
+output/
+scratch/
+target/
+*.parquet
+team.db*
+.DS_Store
+
+# CSVs are data, except test fixtures and the published dev answer
+*.csv
+!fixtures/**/*.csv
+!dev-answer/*.csv
