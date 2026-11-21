@@ -17,13 +17,13 @@ else
   chmod 777 "$OUT" "$SCRATCH"
   release() {
     if [ -n "$(find "$OUT" "$SCRATCH" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
-      docker run --rm --network none --user 1000:1000 -v "$OUT":/output -v "$SCRATCH":/scratch \
-        --entrypoint chmod "${HELPER_IMAGE:-harness-py:latest}" -R a+rwX /output /scratch >/dev/null 2>&1 || true
+      docker run --rm --network none --user 0:0 -v "$OUT":/output -v "$SCRATCH":/scratch \
+        --entrypoint chmod "${HELPER_IMAGE:-python:3.12-slim-bookworm}" -R a+rwX /output /scratch >/dev/null 2>&1 || true
     fi
     rm -rf "$SCRATCH" 2>/dev/null || true
   }
   trap release EXIT
-  flock -s /tmp/bench.lock docker run --rm --platform linux/amd64 \
+  flock -s /tmp/bench.lock docker run --rm --platform linux/amd64 --cpuset-cpus "${VERIFY_CPUS:-8-15}" \
     --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
     --cpus 8 --memory 24g --memory-swap 24g --user 1000:1000 \

@@ -84,13 +84,24 @@ def main():
     links = load_lines(os.path.join(data, "links"), 2, ["a", "b"]).drop_nulls()
     edges = pl.concat([links.select(pl.col("a").alias("x"), pl.col("b").alias("y")),
                        links.select(pl.col("b").alias("x"), pl.col("a").alias("y"))])
+    # hook-and-shortcut: P[x] is always an ID of x's component and never increases.
+    # Hook: P[P[x]] = min(P[P[x]], P[y]) for every edge; shortcut: P = P[P] until stable.
+    # Fixed point => P equal across every edge => one label per component => its minimum.
     lab = edges.select(pl.col("x").alias("id")).unique().with_columns(pl.col("id").alias("lab"))
     while True:
-        nb = edges.join(lab, left_on="y", right_on="id").group_by("x").agg(pl.col("lab").min().alias("nl"))
-        new = lab.join(nb, left_on="id", right_on="x", how="left").with_columns(
-            pl.min_horizontal("lab", "nl").alias("lab2"))
-        changed = new.filter(pl.col("lab2") != pl.col("lab")).height
-        lab = new.select("id", pl.col("lab2").alias("lab"))
+        e = edges.join(lab.rename({"lab": "px"}), left_on="x", right_on="id").join(
+            lab.rename({"lab": "py"}), left_on="y", right_on="id")
+        cand = e.group_by("px").agg(pl.col("py").min().alias("nl"))
+        new = lab.join(cand, left_on="id", right_on="px", how="left").with_columns(
+            pl.min_horizontal("lab", "nl").alias("lab")).select("id", "lab")
+        while True:  # shortcut
+            j = new.join(new.rename({"id": "l", "lab": "ll"}), left_on="lab", right_on="l").select(
+                "id", pl.min_horizontal("lab", "ll").alias("lab"))
+            if j.join(new, on=["id", "lab"], how="anti").height == 0:
+                break
+            new = j
+        changed = new.join(lab, on=["id", "lab"], how="anti").height
+        lab = new
         if changed == 0:
             break
 
