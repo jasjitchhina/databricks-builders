@@ -15,6 +15,7 @@ use std::time::Instant;
 
 static EV_NS: AtomicUsize = AtomicUsize::new(0);
 static CL_NS: AtomicUsize = AtomicUsize::new(0);
+static DD_NS: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
 struct Defer<F: FnMut()>(F);
 impl<F: FnMut()> Drop for Defer<F> {
     fn drop(&mut self) {
@@ -524,6 +525,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
             if n == 0 {
                 return;
             }
+            let _q0 = Instant::now();
             let cap = (n + n / 2).next_power_of_two().max(64);
             table.clear();
             table.resize(cap, 0);
@@ -559,6 +561,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                     }
                 });
             }
+            let _q1 = Instant::now();
             losers.sort_unstable();
             surv.clear();
             let mut li = 0;
@@ -576,7 +579,9 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                     surv.push((r.user, r.ts, price, cat));
                 });
             }
+            let _q2 = Instant::now();
             let n = surv.len();
+            let _qd = Defer(|| { let q3 = Instant::now(); DD_NS[0].fetch_add((_q1 - _q0).as_nanos() as usize, Ordering::Relaxed); DD_NS[1].fetch_add((_q2 - _q1).as_nanos() as usize, Ordering::Relaxed); DD_NS[2].fetch_add((q3 - _q2).as_nanos() as usize, Ordering::Relaxed); });
             for j in 0..n {
                 if j + 2 * PF < n {
                     links.prefetch_filter(surv[j + 2 * PF].0);
@@ -590,6 +595,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
             }
         },
     );
+    if std::env::var_os("FAST_VERBOSE").is_some() { eprintln!("[dedup] cpu: insert {:.1} ms, sort+rewalk {:.1} ms, person+scatter {:.1} ms", DD_NS[0].load(Ordering::Relaxed) as f64 / 1e6, DD_NS[1].load(Ordering::Relaxed) as f64 / 1e6, DD_NS[2].load(Ordering::Relaxed) as f64 / 1e6); }
     let mut deduped = std::mem::ManuallyDrop::new(deduped);
     for d in deduped.iter_mut() {
         d.3.finish();
