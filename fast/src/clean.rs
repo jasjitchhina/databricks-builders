@@ -711,7 +711,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let mut parts_out: Vec<Mutex<Option<Part>>> = (0..NPART).map(|_| Mutex::new(None)).collect();
     {
         let parts_ref = &parts_out;
-        par_items(threads, NPART, |t| {
+        let part_states = par_items(threads, NPART, |t| {
             // recycle this thread's dead event-bucket buffer (dedup is done with it)
             let (b, l) = states[t.min(states.len() - 1)].ev.raw();
             (unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }, GMap::<K, u32>::with_capacity(4096), Vec::<K>::new())
@@ -785,6 +785,26 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             }
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
         });
+        // Donate what is dead and already faulted in (click regions, part-record
+        // regions, unused arena tails) to the global allocator (alloc::DonorAlloc)
+        // for the engine's scratch buffers.
+        if std::env::var_os("FAST_NO_DONATE").is_none() {
+            unsafe {
+                for (bump, _, _) in part_states.iter() {
+                    let (p, l) = bump.rest();
+                    crate::alloc::donate(p, l);
+                }
+                for st in states.iter() {
+                    let (p, l) = st.cl.raw();
+                    crate::alloc::donate(p, l);
+                }
+                for d in deduped.iter() {
+                    let (p, l) = d.3.raw();
+                    crate::alloc::donate(p, l);
+                }
+            }
+        }
+        std::mem::forget(part_states);
     }
     let mut parts: Vec<Part> = parts_out.iter_mut().map(|m| m.get_mut().unwrap().take().unwrap()).collect();
     t("parts");

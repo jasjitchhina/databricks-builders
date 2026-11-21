@@ -503,8 +503,115 @@ impl Bump {
         self.p = a + need;
         Some(a as *mut T)
     }
+    /// The unused rest [p, end).
+    pub fn rest(&self) -> (*mut u8, usize) {
+        let a = (self.p + 63) & !63;
+        (a as *mut u8, self.end.saturating_sub(a))
+    }
     /// Gives back the tail of the last `take` (used < taken).
     pub fn shrink_last<T>(&mut self, at: *mut T, used: usize) {
         self.p = at as usize + used * std::mem::size_of::<T>();
+    }
+}
+
+/// Global-allocator wrapper that serves large allocations (>= 64 KiB) from
+/// "donated" memory: buffers the clean stage no longer needs and that are
+/// already faulted in, so later stages (engine scratch) avoid first-touch page
+/// faults/zeroing. Donated memory is never returned: frees of it are ignored,
+/// and a realloc of it moves to a new block. Everything else goes to `A`.
+pub struct DonorAlloc<A: GlobalAlloc>(pub A);
+
+const DMIN: usize = 64 << 10;
+
+struct Donor {
+    ranges: Vec<(usize, usize)>, // donated [start, end)
+    cur: usize,                  // index of the range being bumped
+    p: usize,                    // bump pointer in ranges[cur]
+}
+
+static DONOR: std::sync::Mutex<Donor> = std::sync::Mutex::new(Donor { ranges: Vec::new(), cur: 0, p: 0 });
+static DONATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Donates [p, p+len) to the allocator. The memory must stay mapped and
+/// unused by anyone else for the rest of the process.
+pub unsafe fn donate(p: *mut u8, len: usize) {
+    let s = (p as usize + 4095) & !4095;
+    let e = (p as usize + len) & !4095;
+    if e <= s + DMIN {
+        return;
+    }
+    let mut d = DONOR.lock().unwrap();
+    if d.ranges.is_empty() {
+        d.p = s;
+    }
+    d.ranges.push((s, e));
+    DONATED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn donor_take(l: Layout) -> *mut u8 {
+    let mut d = DONOR.lock().unwrap();
+    let align = l.align().max(64);
+    while d.cur < d.ranges.len() {
+        let (_, e) = d.ranges[d.cur];
+        let a = (d.p + align - 1) & !(align - 1);
+        if a + l.size() <= e {
+            d.p = a + l.size();
+            return a as *mut u8;
+        }
+        d.cur += 1;
+        if d.cur < d.ranges.len() {
+            d.p = d.ranges[d.cur].0;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+fn in_donor(p: *mut u8) -> bool {
+    let a = p as usize;
+    DONOR.lock().unwrap().ranges.iter().any(|&(s, e)| a >= s && a < e)
+}
+
+unsafe impl<A: GlobalAlloc> GlobalAlloc for DonorAlloc<A> {
+    #[inline]
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if l.size() >= DMIN && DONATED.load(std::sync::atomic::Ordering::Relaxed) {
+            let p = donor_take(l);
+            if !p.is_null() {
+                return p;
+            }
+        }
+        self.0.alloc(l)
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        if l.size() >= DMIN && DONATED.load(std::sync::atomic::Ordering::Relaxed) {
+            let p = donor_take(l);
+            if !p.is_null() {
+                std::ptr::write_bytes(p, 0, l.size());
+                return p;
+            }
+        }
+        self.0.alloc_zeroed(l)
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        if l.size() >= DMIN && DONATED.load(std::sync::atomic::Ordering::Relaxed) && in_donor(p) {
+            return;
+        }
+        self.0.dealloc(p, l)
+    }
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        let donated = DONATED.load(std::sync::atomic::Ordering::Relaxed);
+        if donated && (l.size() >= DMIN && in_donor(p) || new >= DMIN) {
+            let nl = Layout::from_size_align_unchecked(new, l.align());
+            let q = self.alloc(nl);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc(p, l);
+            }
+            return q;
+        }
+        self.0.realloc(p, l, new)
     }
 }
