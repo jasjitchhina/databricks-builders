@@ -21,7 +21,7 @@ impl<F: FnMut()> Drop for Defer<F> {
         (self.0)()
     }
 }
-const NB_BITS: u32 = 8;
+const NB_BITS: u32 = 10;
 const NB: usize = 1 << NB_BITS; // dedup buckets
 const CHUNK: usize = 2 << 20;
 const MAX_PRICE: u64 = 10_000_000;
@@ -89,7 +89,10 @@ fn read_manifest(p: &Path) -> (i64, i64) {
 }
 
 fn data_lines(p: &Path, mut f: impl FnMut(&[u8])) {
-    let b = std::fs::read(p).unwrap_or_default();
+    let b = std::fs::read(p).unwrap_or_else(|e| {
+        eprintln!("fatal: read {}: {e}", p.display());
+        std::process::exit(2)
+    });
     if let Some(h) = memchr::memchr(b'\n', &b) {
         csv::for_lines(&b[h + 1..], &mut f);
     }
@@ -446,8 +449,11 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                 }
                 let n = st.cbuf.len();
                 for j in 0..n {
+                    if j + 2 * PF < n {
+                        links.prefetch_filter(st.cbuf[j + 2 * PF].person);
+                    }
                     if j + PF < n {
-                        links.prefetch(st.cbuf[j + PF].person);
+                        links.prefetch_if(st.cbuf[j + PF].person);
                     }
                     let mut r = st.cbuf[j];
                     r.person = person_of(&links, r.person);
@@ -539,8 +545,11 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
             }
             let n = surv.len();
             for j in 0..n {
+                if j + 2 * PF < n {
+                    links.prefetch_filter(surv[j + 2 * PF].0);
+                }
                 if j + PF < n {
-                    links.prefetch(surv[j + PF].0);
+                    links.prefetch_if(surv[j + PF].0);
                 }
                 let (user, ts, price, cat) = surv[j];
                 let person = person_of(&links, user);

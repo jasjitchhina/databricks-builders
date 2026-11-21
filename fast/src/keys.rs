@@ -203,6 +203,13 @@ pub struct GSharded<K: IdKey> {
     slots: crate::alloc::HugeBuf<(K, K)>,
     shard_bits: u32,
     mask: usize,
+    /// Blocked Bloom filter over the inserted keys (one u64 word per key, 3
+    /// bits; idea and numbers from h1 c399cf9). No false negatives, so a
+    /// negative answer is exact; ~16 bits/key keeps it cache-resident while
+    /// the map itself is DRAM-sized. Most lookups (users that are their own
+    /// name) stop here.
+    filter: crate::alloc::HugeBuf<u64>,
+    fmask: usize,
 }
 
 unsafe impl<K: IdKey> Sync for GSharded<K> {}
@@ -215,7 +222,29 @@ impl<K: IdKey> GSharded<K> {
     }
     pub fn new(max_per_shard: usize) -> Self {
         let per = (max_per_shard * 2).next_power_of_two().max(16);
-        GSharded { slots: crate::alloc::HugeBuf::zeroed(per * Self::SHARDS), shard_bits: per.trailing_zeros(), mask: per - 1 }
+        let words = (max_per_shard * Self::SHARDS * 16 / 64).next_power_of_two().max(8);
+        GSharded {
+            slots: crate::alloc::HugeBuf::zeroed(per * Self::SHARDS),
+            shard_bits: per.trailing_zeros(),
+            mask: per - 1,
+            filter: crate::alloc::HugeBuf::zeroed(words),
+            fmask: words - 1,
+        }
+    }
+    /// Filter word and bits, from a remix of the key hash (independent of the
+    /// shard/slot bits).
+    #[inline(always)]
+    fn fbits(&self, h: u64) -> (usize, u64) {
+        let mut x = h.rotate_left(21).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        x ^= x >> 31;
+        let w = (x as usize) & self.fmask;
+        let b = (1u64 << ((x >> 40) & 63)) | (1u64 << ((x >> 46) & 63)) | (1u64 << ((x >> 52) & 63));
+        (w, b)
+    }
+    #[inline(always)]
+    fn maybe_h(&self, h: u64) -> bool {
+        let (w, b) = self.fbits(h);
+        unsafe { *self.filter.as_ptr().add(w) & b == b }
     }
     /// # Safety: k belongs to shard s; one writer per shard.
     #[inline(always)]
@@ -226,6 +255,9 @@ impl<K: IdKey> GSharded<K> {
             let e = &mut *base.add(i);
             if e.0.is_zero() || e.0 == k {
                 *e = (k, v);
+                let (w, b) = self.fbits(k.hash());
+                let f = &*(self.filter.as_ptr().add(w) as *const std::sync::atomic::AtomicU64);
+                f.fetch_or(b, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             i = (i + 1) & self.mask;
@@ -238,6 +270,9 @@ impl<K: IdKey> GSharded<K> {
     }
     #[inline(always)]
     pub fn get(&self, k: K) -> Option<K> {
+        if !self.maybe_h(k.hash()) {
+            return None;
+        }
         let (base, mut i) = self.slot(k);
         loop {
             let e = unsafe { &*base.add(i) };
@@ -254,6 +289,19 @@ impl<K: IdKey> GSharded<K> {
     pub fn prefetch(&self, k: K) {
         let (base, i) = self.slot(k);
         prefetch(unsafe { base.add(i) } as *const u8);
+    }
+    /// Pipeline stage 1: bring the filter word in.
+    #[inline(always)]
+    pub fn prefetch_filter(&self, k: K) {
+        let (w, _) = self.fbits(k.hash());
+        prefetch(unsafe { self.filter.as_ptr().add(w) } as *const u8);
+    }
+    /// Pipeline stage 2: prefetch the slot only if the key may be present.
+    #[inline(always)]
+    pub fn prefetch_if(&self, k: K) {
+        if self.maybe_h(k.hash()) {
+            self.prefetch(k);
+        }
     }
 }
 
