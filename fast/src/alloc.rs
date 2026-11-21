@@ -191,7 +191,8 @@ impl<T: Copy> Drop for HugeBuf<T> {
 /// Region starts are skewed by r*64 bytes mod 4096 so the region tails do not
 /// all alias the same L1/L2 sets.
 pub struct Regions<T: Copy> {
-    buf: HugeBuf<u8>,
+    _buf: Option<HugeBuf<u8>>,
+    _vbuf: Vec<u8>,
     base: Vec<*mut T>,
     cap: usize,
     len: Vec<u32>,
@@ -203,13 +204,24 @@ unsafe impl<T: Copy + Sync> Sync for Regions<T> {}
 
 impl<T: Copy> Regions<T> {
     pub fn new(nreg: usize, cap: usize) -> Self {
+        Self::new_with(nreg, cap, true)
+    }
+    /// `huge`: back with a THP mapping; else with a plain (malloc) buffer.
+    pub fn new_with(nreg: usize, cap: usize, huge: bool) -> Self {
         let cap = cap.max(1);
         let sz = std::mem::size_of::<T>();
         assert!(std::mem::align_of::<T>() <= 64);
-        let stride = (cap * sz + 4095) & !4095;
-        let buf = HugeBuf::<u8>::zeroed(nreg * stride + 64 * 64 + 64);
-        let base = (0..nreg).map(|r| unsafe { buf.as_mut_ptr().add(r * stride + (r % 64) * 64) as *mut T }).collect();
-        Regions { buf, base, cap, len: vec![0; nreg], spill: (0..nreg).map(|_| Vec::new()).collect() }
+        let stride = (cap * sz + 64 * 64 + 4095) & !4095; // room for the max skew
+        let bytes = nreg * stride + 64 * 64 + 4096;
+        let (hb, mut vb) = if huge { (Some(HugeBuf::<u8>::zeroed(bytes)), Vec::new()) } else { (None, Vec::<u8>::with_capacity(bytes)) };
+        let p0 = match &hb { Some(h) => h.as_mut_ptr(), None => vb.as_mut_ptr() };
+        let p0 = ((p0 as usize + 4095) & !4095) as *mut u8;
+        let base = (0..nreg).map(|r| unsafe { p0.add(r * stride + (r % 64) * 64) as *mut T }).collect();
+        Regions { _buf: hb, _vbuf: vb, base, cap, len: vec![0; nreg], spill: (0..nreg).map(|_| Vec::new()).collect() }
+    }
+    pub fn clear(&mut self) {
+        self.len.iter_mut().for_each(|l| *l = 0);
+        self.spill.iter_mut().for_each(|v| v.clear());
     }
     #[inline(always)]
     pub fn push(&mut self, r: usize, x: T) {
@@ -264,6 +276,198 @@ impl<T: Copy> Regions<T> {
         let n = a.len();
         for (i, x) in b.iter().enumerate() {
             f(n + i, x);
+        }
+    }
+}
+
+/// Partitioned append buffer with software write-combining: each region keeps
+/// K items staged in a small cache-resident buffer and flushes them as whole
+/// 64-byte lines with non-temporal stores (no read-for-ownership of the
+/// destination). K * size_of::<T>() must be a multiple of 64. Call `finish`
+/// before reading.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct Stage<T: Copy, const K: usize>(pub [T; K]);
+
+pub struct WcRegions<T: Copy, const K: usize> {
+    stage: Vec<Stage<T, K>>,
+    nst: Vec<u8>,
+    _vbuf: Vec<u8>,
+    _hbuf: Option<HugeBuf<u8>>,
+    base: Vec<*mut T>,
+    cap: usize,
+    len: Vec<u32>,
+    spill: Vec<Vec<T>>,
+}
+
+unsafe impl<T: Copy + Send, const K: usize> Send for WcRegions<T, K> {}
+unsafe impl<T: Copy + Sync, const K: usize> Sync for WcRegions<T, K> {}
+
+impl<T: Copy, const K: usize> WcRegions<T, K> {
+    pub fn new(nreg: usize, cap: usize) -> Self {
+        Self::new_with(nreg, cap, false)
+    }
+    pub fn new_with(nreg: usize, cap: usize, huge: bool) -> Self {
+        let sz = std::mem::size_of::<T>();
+        assert!((K * sz) % 64 == 0 && std::mem::align_of::<T>() <= 64);
+        let cap = (cap.max(K) + K - 1) / K * K;
+        let stride = (cap * sz + 64 * 64 + 4095) & !4095; // room for the max skew
+        let bytes = nreg * stride + 64 * 64 + 4096;
+        let (hb, mut vb) = if huge { (Some(HugeBuf::<u8>::zeroed(bytes)), Vec::new()) } else { (None, Vec::<u8>::with_capacity(bytes)) };
+        let p0 = match &hb { Some(h) => h.as_mut_ptr(), None => vb.as_mut_ptr() };
+        let p0 = ((p0 as usize + 4095) & !4095) as *mut u8;
+        let base = (0..nreg).map(|r| unsafe { p0.add(r * stride + (r % 64) * 64) as *mut T }).collect();
+        WcRegions {
+            stage: vec![Stage(unsafe { std::mem::zeroed() }); nreg],
+            nst: vec![0; nreg],
+            _vbuf: vb,
+            _hbuf: hb,
+            base,
+            cap,
+            len: vec![0; nreg],
+            spill: (0..nreg).map(|_| Vec::new()).collect(),
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, r: usize, x: T) {
+        unsafe {
+            let k = *self.nst.get_unchecked(r) as usize;
+            let st = self.stage.get_unchecked_mut(r);
+            *st.0.get_unchecked_mut(k) = x;
+            if k + 1 < K {
+                *self.nst.get_unchecked_mut(r) = (k + 1) as u8;
+            } else {
+                *self.nst.get_unchecked_mut(r) = 0;
+                self.flush_full(r);
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn flush_full(&mut self, r: usize) {
+        let l = *self.len.get_unchecked(r) as usize;
+        if l + K <= self.cap {
+            let dst = self.base.get_unchecked(r).add(l) as *mut u8;
+            let src = self.stage.get_unchecked(r) as *const Stage<T, K> as *const u8;
+            nt_copy(dst, src, K * std::mem::size_of::<T>());
+            *self.len.get_unchecked_mut(r) += K as u32;
+        } else {
+            let st = self.stage[r];
+            self.spill[r].extend_from_slice(&st.0);
+        }
+    }
+    /// Flushes partial stages; afterwards `get` sees every item.
+    pub fn finish(&mut self) {
+        for r in 0..self.nst.len() {
+            let k = self.nst[r] as usize;
+            let st = self.stage[r];
+            for i in 0..k {
+                let l = self.len[r] as usize;
+                if l < self.cap {
+                    unsafe { self.base[r].add(l).write(st.0[i]) };
+                    self.len[r] += 1;
+                } else {
+                    self.spill[r].push(st.0[i]);
+                }
+            }
+            self.nst[r] = 0;
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
+    }
+    pub fn clear(&mut self) {
+        self.len.iter_mut().for_each(|l| *l = 0);
+        self.nst.iter_mut().for_each(|l| *l = 0);
+        self.spill.iter_mut().for_each(|v| v.clear());
+    }
+    #[inline]
+    pub fn len_of(&self, r: usize) -> usize {
+        self.len[r] as usize + self.spill[r].len()
+    }
+    #[inline]
+    pub fn get(&self, r: usize) -> (&[T], &[T]) {
+        (unsafe { std::slice::from_raw_parts(self.base[r], self.len[r] as usize) }, &self.spill[r])
+    }
+    #[inline(always)]
+    pub fn at(&self, r: usize, i: usize) -> &T {
+        let l = unsafe { *self.len.get_unchecked(r) } as usize;
+        if i < l {
+            unsafe { &*self.base.get_unchecked(r).add(i) }
+        } else {
+            unsafe { self.spill.get_unchecked(r).get_unchecked(i - l) }
+        }
+    }
+    #[inline(always)]
+    pub fn each(&self, r: usize, mut f: impl FnMut(usize, &T)) {
+        let (a, b) = self.get(r);
+        for (i, x) in a.iter().enumerate() {
+            f(i, x);
+        }
+        let n = a.len();
+        for (i, x) in b.iter().enumerate() {
+            f(n + i, x);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn nt_copy(dst: *mut u8, src: *const u8, n: usize) {
+    #[cfg(target_feature = "avx2")]
+    {
+        use std::arch::x86_64::*;
+        let mut i = 0;
+        while i < n {
+            let v = _mm256_load_si256(src.add(i) as *const __m256i);
+            _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
+            i += 32;
+        }
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    std::ptr::copy_nonoverlapping(src, dst, n);
+}
+
+/// Orders this thread's non-temporal stores before anything that follows
+/// (must run on the thread that issued them, before the data is shared).
+#[inline(always)]
+pub fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wc_regions_full_and_spill() {
+        for &(nreg, cap) in &[(256usize, 85usize), (70, 64), (3, 1), (65, 4096 / 48 * 4)] {
+            let mut w = WcRegions::<[u64; 6], 4>::new(nreg, cap);
+            let mut r2 = Regions::<[u64; 6]>::new_with(nreg, cap, false);
+            let per = cap + 13;
+            for i in 0..per {
+                for r in 0..nreg {
+                    let x = [r as u64, i as u64, 7, 7, 7, 7];
+                    w.push(r, x);
+                    r2.push(r, x);
+                }
+            }
+            w.finish();
+            for r in 0..nreg {
+                assert_eq!(w.len_of(r), per);
+                assert_eq!(r2.len_of(r), per);
+                let mut n = 0;
+                w.each(r, |i, x| {
+                    assert_eq!(*x, [r as u64, i as u64, 7, 7, 7, 7]);
+                    assert_eq!(w.at(r, i), x);
+                    n += 1;
+                });
+                assert_eq!(n, per);
+                for (i, x) in r2.iter(r).enumerate() {
+                    assert_eq!(*x, [r as u64, i as u64, 7, 7, 7, 7]);
+                }
+            }
         }
     }
 }
