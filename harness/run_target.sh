@@ -23,7 +23,7 @@ else
     rm -rf "$SCRATCH" 2>/dev/null || true
   }
   trap release EXIT
-  flock -s /tmp/bench.lock docker run --rm --platform linux/amd64 --cpuset-cpus "${VERIFY_CPUS:-8-15}" \
+  flock -s /tmp/bench.lock docker run --rm --platform linux/amd64 --cpuset-cpus "${VERIFY_CPUS:-8-15,24-31}" \
     --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
     --cpus 8 --memory 24g --memory-swap 24g --user 1000:1000 \

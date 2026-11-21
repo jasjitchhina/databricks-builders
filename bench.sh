@@ -15,6 +15,7 @@
 # docker-run wall time, peak cgroup memory (memory.peak, polled every 20 ms), and the median.
 # If an oracle answer exists at ~/data/oracle/<dataset>/out/ the first run's output is diffed against it.
 # Results are appended to ~/data/bench/results.tsv.
+# Env: BENCH_CPUSET=0-3,16-19 runs on 4 cores x 2 HT (scorer-like; default 0-7 = 8 cores, the official number).
 # Env: BENCH_ENV="FAST_TIMING=1 ..." extra container env; BENCH_SHOW_LOG=1 prints container stderr/stdout.
 set -euo pipefail
 
@@ -22,6 +23,7 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 DATA_ROOT=${DATA_ROOT:-$HOME/data}
 RUNS=3
 COLD=0
+CPUSET=${BENCH_CPUSET:-0-7}
 REV=""
 IMAGE=""
 BUILD=1
@@ -58,7 +60,7 @@ if [ -z "$IMAGE" ]; then
 fi
 if [ "$BUILD" = 1 ]; then
   echo "== building $IMAGE from $CTX ($COMMIT)" >&2
-  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$IMAGE" "$CTX" >&2
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-15,24-31 --platform linux/amd64 -t "$IMAGE" "$CTX" >&2
 fi
 [ -n "$REV" ] && rm -rf "$CTX"
 
@@ -98,7 +100,7 @@ median() { sort -g | awk '{a[NR]=$1} END{ if(NR%2) print a[(NR+1)/2]; else print
 for DS in "${DATASETS[@]}"; do
   DATA=$(resolve "$DS")
   NAME=$(basename "$DATA")
-  TAG=$NAME; [ "$COLD" = 1 ] && TAG="$NAME(cold)"
+  TAG=$NAME; [ "$COLD" = 1 ] && TAG="$NAME(cold)"; [ "$CPUSET" != 0-7 ] && TAG="$TAG@cpus=$CPUSET"
   TIMES=(); PEAKS=(); CHECK="no-oracle"
   for ((r=1; r<=RUNS; r++)); do
     rm -rf "$WORK" 2>/dev/null || cleanup
@@ -107,7 +109,7 @@ for DS in "${DATASETS[@]}"; do
     [ "$COLD" = 1 ] && python3 "$ROOT/harness/evict.py" "$DATA"
     T0=$(date +%s.%N)
     CID=$(docker create --platform linux/amd64 \
-      --cpuset-cpus 0-7 --cpus 8 --memory 24g --memory-swap 24g \
+      --cpuset-cpus "$CPUSET" --cpus 8 --memory 24g --memory-swap 24g \
       --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
       --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 \
       --user 1000:1000 \

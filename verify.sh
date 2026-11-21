@@ -27,12 +27,12 @@ if [ "$TARGET" = "-r" ]; then
   git -C "$ROOT" archive "$COMMIT" | tar -x -C "$CTX"
   TARGET="verify-rev-$COMMIT:latest"
   echo "== building $TARGET from $REV ($COMMIT)" >&2
-  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-15,24-31 --platform linux/amd64 -t "$TARGET" "$CTX" >&2 || { echo "VERIFY FAIL: build"; rm -rf "$CTX"; exit 1; }
   rm -rf "$CTX"
 elif [ -z "$TARGET" ]; then
   TARGET="verify-$(basename "$ROOT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_.\n-' '-'):latest"
   echo "== building $TARGET" >&2
-  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
+  flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-15,24-31 --platform linux/amd64 -t "$TARGET" "$ROOT" >&2 || { echo "VERIFY FAIL: build"; exit 1; }
 elif [ -f "$TARGET" ]; then
   TARGET=$(cd "$(dirname "$TARGET")" && pwd)/$(basename "$TARGET")
 fi
@@ -71,8 +71,8 @@ check() {  # check NAME DATA ANSWER
     echo "FAIL $name"; cat "$WORK/cmp-$name.txt"; FAILS+=("$name")
   fi
   if [ "$name" = dev ] || [ "$name" = adv-synth-s2 ]; then  # independent Parquet readers (pyarrow full validate + DuckDB)
-    docker image inspect harness-py:latest >/dev/null 2>&1 || flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-31 -t harness-py:latest "$ROOT/harness/pyimg" >/dev/null
-    if docker run --rm --network none --cpuset-cpus 8-15 -v "$out":/o:ro -v "$ROOT/harness":/h:ro harness-py:latest python3 /h/pqcheck.py /o > "$WORK/pq-$name.txt" 2>&1; then
+    docker image inspect harness-py:latest >/dev/null 2>&1 || flock -s /tmp/bench.lock docker build -q --cpuset-cpus 8-15,24-31 -t harness-py:latest "$ROOT/harness/pyimg" >/dev/null
+    if docker run --rm --network none --cpuset-cpus 8-15,24-31 -v "$out":/o:ro -v "$ROOT/harness":/h:ro harness-py:latest python3 /h/pqcheck.py /o > "$WORK/pq-$name.txt" 2>&1; then
       echo "ok   $name parquet readers (pyarrow+duckdb)"
     else echo "FAIL $name parquet readers"; cat "$WORK/pq-$name.txt"; FAILS+=("$name:parquet"); fi
   fi
