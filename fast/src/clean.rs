@@ -941,7 +941,13 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
 
 #[inline(always)]
 fn bucket_of<K: IdKey>(r: &ERec<K>, nbm: u64) -> usize {
-    (r.eid.hash() & nbm) as usize
+    // any deterministic function of the event_id works (copies share it);
+    // multiply-shift is cheaper than the full mix used by the dedup tables
+    let h = if K::WIDE { r.eid.hash() } else {
+        let k: u64 = unsafe { std::mem::transmute_copy(&r.eid) };
+        k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40
+    };
+    (h & nbm) as usize
 }
 
 /// Single-thread microbenchmark of the event parse path over in-memory files

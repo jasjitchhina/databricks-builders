@@ -13,7 +13,7 @@ fn d2(b: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let yoe = year - era * 400;
@@ -22,7 +22,7 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 #[inline(always)]
-fn is_leap(y: i64) -> bool {
+const fn is_leap(y: i64) -> bool {
     y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
@@ -35,21 +35,26 @@ struct Tables {
     mlen: [u8; YN * 12],
 }
 
-static TABLES: std::sync::LazyLock<Tables> = std::sync::LazyLock::new(|| {
+// Built at compile time: no lazy-init check on the per-row path.
+static TABLES: Tables = {
     let mut t = Tables { days: [0; YN * 12], mlen: [0; YN * 12] };
-    for yi in 0..YN {
+    let mut yi = 0;
+    while yi < YN {
         let y = YMIN + yi as i64;
-        for m in 1..=12i64 {
+        let mut m = 1i64;
+        while m <= 12 {
             t.days[yi * 12 + m as usize - 1] = days_from_civil(y, m, 1) as i32;
             t.mlen[yi * 12 + m as usize - 1] = match m {
                 2 => if is_leap(y) { 29 } else { 28 },
                 4 | 6 | 9 | 11 => 30,
                 _ => 31,
             };
+            m += 1;
         }
+        yi += 1;
     }
     t
-});
+};
 
 const D8: u64 = 0x3030_3030_3030_3030;
 
@@ -113,7 +118,7 @@ unsafe fn civil19_simd(p: *const u8) -> Option<i64> {
     let sod = (_mm_extract_epi32(f, 2) + _mm_extract_epi32(f, 3)) as i64;
     let (mo, dd) = ((md >> 5) as i64, (md & 31) as i64);
     let days = if (YMIN..YMIN + YN as i64).contains(&y) {
-        let t = &*TABLES;
+        let t = &TABLES;
         let i = (y - YMIN) as usize * 12 + mo as usize - 1;
         if dd > t.mlen[i] as i64 {
             return None;
@@ -162,7 +167,7 @@ unsafe fn civil19_v2(p: *const u8) -> Option<i64> {
     let (mo, dd) = ((md & 0xFFFF) as i64, (md >> 16) as i64);
     let secs = _mm_extract_epi32(w, 2) as i64 + _mm_extract_epi32(w, 3) as i64;
     let days = if (YMIN..YMIN + YN as i64).contains(&y) {
-        let t = &*TABLES;
+        let t = &TABLES;
         let i = (y - YMIN) as usize * 12 + mo as usize - 1;
         if dd > *t.mlen.get_unchecked(i) as i64 {
             return None;
@@ -188,7 +193,7 @@ fn finish_civil(y: i64, mo: i64, dd: i64, h: i64, mi: i64, s: i64) -> Option<i64
         return None;
     }
     let days = if (YMIN..YMIN + YN as i64).contains(&y) {
-        let t = &*TABLES;
+        let t = &TABLES;
         let i = (y - YMIN) as usize * 12 + mo as usize - 1;
         if dd > t.mlen[i] as i64 {
             return None;
@@ -236,7 +241,7 @@ fn civil19_swar(b: &[u8]) -> Option<i64> {
         return None;
     }
     let days = if (YMIN..YMIN + YN as i64).contains(&y) {
-        let t = &*TABLES;
+        let t = &TABLES;
         let i = (y - YMIN) as usize * 12 + mo as usize - 1;
         if dd > t.mlen[i] as i64 {
             return None;
@@ -316,7 +321,7 @@ unsafe fn f1_trusted(p: *const u8) -> Option<i64> {
     let sod = (_mm_extract_epi32(f, 2) + _mm_extract_epi32(f, 3)) as i64;
     let (mo, dd) = (md >> 5, (md & 31) as i64);
     let i = ((y - YMIN) as usize * 12 + mo).wrapping_sub(1).min(YN * 12 - 1);
-    let t = &*TABLES;
+    let t = &TABLES;
     Some((t.days[i] as i64 + dd - 1) * 86_400_000 + sod * 1000)
 }
 
