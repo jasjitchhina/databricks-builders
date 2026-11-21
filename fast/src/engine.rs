@@ -344,6 +344,17 @@ impl Worker {
         }
     }
 
+    /// Pre-size the user_daily column buffers (avoids regrow copies + refaults).
+    pub fn reserve_rows(&mut self, rows: usize) {
+        for (i, col) in self.s.ucols.iter_mut().enumerate() {
+            let per = match i { 0 => 16, 1 => 4, 5 => 12, _ => 8 };
+            col.data.reserve(rows * per);
+            if i == 5 {
+                col.def.reserve(rows);
+            }
+        }
+    }
+
     /// Sessionize/attribute/aggregate every person of one part.
     pub fn part(&mut self, ctx: &Ctx, part: &Part) {
         let s = &mut self.s;
@@ -458,11 +469,15 @@ pub fn run(c: &Cleaned, dump: bool, user_dir: Option<&Path>) -> Output {
     let mut order: Vec<usize> = (0..c.parts.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(c.parts[i].ev.len() + c.parts[i].cl.len()));
     let nthreads = crate::threads();
+    // user_daily rows ~ 3.4 per person on generator data; reserve ~4.5 so columns never regrow
+    let persons: usize = c.parts.iter().map(|p| p.person_names.len()).sum();
+    let est_rows = persons * 9 / 2 / nthreads + 1024;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let ctx_ref = &ctx;
     let worker = |w: usize| {
         let tw = std::time::Instant::now();
         let mut wk = Worker::new(ctx_ref);
+        wk.reserve_rows(est_rows);
         loop {
             let oi = next.fetch_add(1, Relaxed);
             if oi >= order.len() {
