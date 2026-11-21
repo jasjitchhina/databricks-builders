@@ -13,13 +13,14 @@ use std::time::Instant;
 
 static EV_NS: AtomicUsize = AtomicUsize::new(0);
 static CL_NS: AtomicUsize = AtomicUsize::new(0);
+static DD_NS: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
 struct Defer<F: FnMut()>(F);
 impl<F: FnMut()> Drop for Defer<F> {
     fn drop(&mut self) {
         (self.0)()
     }
 }
-const NB_BITS: u32 = 8;
+const NB_BITS: u32 = 10;
 const NB: usize = 1 << NB_BITS; // dedup buckets
 const CHUNK: usize = 2 << 20;
 const MAX_PRICE: u64 = 10_000_000;
@@ -369,8 +370,11 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                 });
                 let n = st.cbuf.len();
                 for j in 0..n {
+                    if j + 2 * PF < n {
+                        links.prefetch_filter(st.cbuf[j + 2 * PF].person);
+                    }
                     if j + PF < n {
-                        links.prefetch(st.cbuf[j + PF].person);
+                        links.prefetch_if(st.cbuf[j + PF].person);
                     }
                     let mut r = st.cbuf[j];
                     r.person = person_of(&links, r.person);
@@ -394,6 +398,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             if n == 0 {
                 return;
             }
+            let _q0 = Instant::now();
             let cap = (n + n / 2).next_power_of_two().max(64);
             table.clear();
             table.resize(cap, 0);
@@ -429,6 +434,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                     }
                 });
             }
+            let _q1 = Instant::now();
             losers.sort_unstable();
             surv.clear();
             let mut li = 0;
@@ -446,10 +452,15 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                     surv.push((r.user, r.ts, price, cat));
                 });
             }
+            let _q2 = Instant::now();
             let n = surv.len();
+            let _qd = Defer(|| { let q3 = Instant::now(); DD_NS[0].fetch_add((_q1 - _q0).as_nanos() as usize, Ordering::Relaxed); DD_NS[1].fetch_add((_q2 - _q1).as_nanos() as usize, Ordering::Relaxed); DD_NS[2].fetch_add((q3 - _q2).as_nanos() as usize, Ordering::Relaxed); });
             for j in 0..n {
+                if j + 2 * PF < n {
+                    links.prefetch_filter(surv[j + 2 * PF].0);
+                }
                 if j + PF < n {
-                    links.prefetch(surv[j + PF].0);
+                    links.prefetch_if(surv[j + PF].0);
                 }
                 let (user, ts, price, cat) = surv[j];
                 let person = person_of(&links, user);
@@ -457,6 +468,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             }
         },
     );
+    if std::env::var_os("FAST_VERBOSE").is_some() { eprintln!("[dedup] cpu: insert {:.1} ms, sort+rewalk {:.1} ms, person+scatter {:.1} ms", DD_NS[0].load(Ordering::Relaxed) as f64 / 1e6, DD_NS[1].load(Ordering::Relaxed) as f64 / 1e6, DD_NS[2].load(Ordering::Relaxed) as f64 / 1e6); }
     t("dedup");
 
     // per part: dense person ids, clicks
