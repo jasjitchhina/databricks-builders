@@ -125,6 +125,63 @@ unsafe fn civil19_simd(p: *const u8) -> Option<i64> {
     Some((days * 86_400 + sod) * 1000)
 }
 
+/// h1 F1 kernel (task 40/42): same contract as `civil19_simd` (bytes 0..19 of p, the caller has
+/// checked byte 19 == 'Z'), fewer instructions: separators via 3 integer compares, one SIMD digit
+/// check, one SIMD range compare (MM 1..12, DD 1..31, hh<=23, mm<=59, ss<=59), madd for
+/// hh*3600+mm*60, 3 extracts. Month length is checked against the calendar table.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn civil19_v2(p: *const u8) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let s1 = u64::from_le_bytes(*(p as *const [u8; 8])); // YYYY-MM-
+    let s2 = u64::from_le_bytes(*(p.add(8) as *const [u8; 8])); // DDTHH:MM
+    let s3 = *p.add(16); // ':'
+    if (s1 & 0xFF00_00FF_0000_0000) != 0x2D00_002D_0000_0000 || (s2 & 0x0000_FF00_00FF_0000) != 0x0000_3A00_0054_0000 || s3 != b':' {
+        return None;
+    }
+    let lo = _mm_loadu_si128(p as *const __m128i); // bytes 0..16
+    let hi = _mm_loadu_si128(p.add(4) as *const __m128i); // bytes 4..20
+    // digits Y0..Y3 M0 M1 D0 D1 H0 H1 (lo 0,1,2,3,5,6,8,9,11,12), m0 m1 S0 S1 (hi 10,11,13,14)
+    let dig = _mm_or_si128(
+        _mm_shuffle_epi8(lo, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, -1, -1, -1, -1, -1, -1)),
+        _mm_shuffle_epi8(hi, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 13, 14, -1, -1)),
+    );
+    let d = _mm_sub_epi8(dig, _mm_setr_epi8(48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 0, 0));
+    let okd = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)); // lanes 14,15 are 0
+    let v = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A)); // u16: Y0Y1 Y2Y3 MM DD hh mm ss 0
+    let bad = _mm_or_si128(
+        _mm_cmpgt_epi16(v, _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0)),
+        _mm_cmpgt_epi16(_mm_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0), v),
+    );
+    if okd != 0xFFFF || _mm_movemask_epi8(bad) != 0 {
+        return None;
+    }
+    let w = _mm_madd_epi16(v, _mm_setr_epi16(100, 1, 0, 0, 3600, 60, 1, 0)); // i32: y, 0, hh*3600+mm*60, ss
+    let y = _mm_cvtsi128_si32(w) as i64;
+    let md = _mm_extract_epi32(v, 1) as u32; // u16 lanes 2,3: MM (low), DD (high)
+    let (mo, dd) = ((md & 0xFFFF) as i64, (md >> 16) as i64);
+    let secs = _mm_extract_epi32(w, 2) as i64 + _mm_extract_epi32(w, 3) as i64;
+    let days = if (YMIN..YMIN + YN as i64).contains(&y) {
+        let t = &*TABLES;
+        let i = (y - YMIN) as usize * 12 + mo as usize - 1;
+        if dd > *t.mlen.get_unchecked(i) as i64 {
+            return None;
+        }
+        *t.days.get_unchecked(i) as i64 + dd - 1
+    } else {
+        let mdays = match mo {
+            2 => if is_leap(y) { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if dd > mdays {
+            return None;
+        }
+        days_from_civil(y, mo, dd)
+    };
+    Some(days * DAY_MS + secs * 1000)
+}
+
 #[inline(always)]
 fn finish_civil(y: i64, mo: i64, dd: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
     if !(1..=12).contains(&mo) || dd < 1 || h > 23 || mi > 59 || s > 59 {
@@ -225,6 +282,9 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
 #[inline(always)]
 pub fn parse_ts_in(m: &[u8], b: &[u8]) -> Option<i64> {
     match b.len() {
+        #[cfg(target_feature = "avx2")]
+        20 if b[19] == b'Z' => return unsafe { civil19_v2(b.as_ptr()) },
+        #[cfg(not(target_feature = "avx2"))]
         20 if b[19] == b'Z' => return civil19(b),
         25 if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' => return parse_ts(b),
         _ => {}
@@ -387,6 +447,85 @@ mod fuzz {
             padded.extend_from_slice(&v);
             padded.extend_from_slice(b",x");
             assert_eq!(parse_ts_in(&padded, &padded[20..20 + v.len()]), ref_ts(&v), "in {:?}", String::from_utf8_lossy(&v));
+        }
+    }
+}
+
+#[cfg(all(test, target_feature = "avx2"))]
+mod civil19_v2_tests {
+    use super::*;
+    /// Spec reference straight from rules.md (no SIMD, no tables).
+    fn spec_f1(b: &[u8]) -> Option<i64> {
+        if b.len() != 20 || b[19] != b'Z' || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+            return None;
+        }
+        let num = |r: std::ops::Range<usize>| -> Option<i64> {
+            let mut v = 0i64;
+            for &c in &b[r] {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                v = v * 10 + (c - b'0') as i64;
+            }
+            Some(v)
+        };
+        let (y, mo, d, h, mi, s) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
+        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
+            return None;
+        }
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let ml = match mo { 2 => if leap { 29 } else { 28 }, 4 | 6 | 9 | 11 => 30, _ => 31 };
+        if d > ml {
+            return None;
+        }
+        Some(((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+    }
+    fn check(b: &[u8]) {
+        let mut buf = b.to_vec();
+        buf.extend_from_slice(&[0u8; 32]);
+        let f = &buf[..b.len()];
+        let got = parse_ts_in(&buf, f);
+        let old = if f.len() == 20 && f[19] == b'Z' { civil19_swar(f) } else { parse_ts(f) };
+        assert_eq!(got, old, "vs civil19_swar/parse_ts: {:?}", String::from_utf8_lossy(f));
+        if f.len() == 20 && f[19] == b'Z' {
+            assert_eq!(got, spec_f1(f), "vs spec: {:?}", String::from_utf8_lossy(f));
+        }
+    }
+    #[test]
+    fn edge_matrix() {
+        // every bad form from rules.md plus calendar edges, at every year boundary of the table
+        let dates: &[&str] = &["2026-10-03", "2028-02-29", "2027-02-29", "2024-02-29", "2100-02-29", "2000-02-29", "1900-02-29",
+            "2026-02-30", "2026-04-31", "2026-06-31", "2026-09-31", "2026-11-31", "2026-01-31", "2026-12-31", "2026-13-01",
+            "2026-00-10", "2026-10-00", "2026-10-32", "2026-99-99", "0000-01-01", "0001-01-01", "1899-12-31", "1900-01-01",
+            "2299-12-31", "2300-01-01", "9999-12-31", "1970-01-01", "1969-12-31"];
+        let times: &[&str] = &["00:00:00", "23:59:59", "24:00:00", "23:60:00", "23:59:60", "12:00:00", "99:99:99", "09:05:07"];
+        for d in dates { for t in times { check(format!("{d}T{t}Z").as_bytes()); } }
+        let bad: &[&[u8]] = &[b"2026-10-03 10:00:00Z", b"2026-10-03t10:00:00Z", b"2026-10-03T10:00:00z", b"2026/10/03T10:00:00Z",
+            b"2026-10-03T10-00:00Z", b"2026-10-03T10:00-00Z", b"2026-10-03T10:00:0\rZ", b"2026-10-03T10:00:00\r", b"\"2026-10-03T10:00:0Z",
+            b"2O26-10-03T10:00:00Z", b"2026-1O-03T10:00:00Z", b"+026-10-03T10:00:00Z", b"-026-10-03T10:00:00Z", b" 026-10-03T10:00:00Z",
+            b"2026-10-03T10:00:00.0", b"2026-10-03T1:00:000Z", b"\xd9\xa2026-10-3T10:00:0Z", b"2026-10-03T10:00:00Z"];
+        for b in bad { check(b); }
+        // full-width / Arabic-Indic digits in every digit position (multi-byte, so length changes)
+        for i in [0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+            let mut v = b"2026-10-03T10:00:00Z".to_vec();
+            v[i] = b'0' + 10; // ':' (one past '9')
+            check(&v);
+            v[i] = b'0' - 1; // '/'
+            check(&v);
+            for c in [0u8, 0x80, 0xFF, b'a', b'A', b' '] { v[i] = c; check(&v); }
+        }
+    }
+    #[test]
+    fn random_vs_spec() {
+        let mut s = 0x1234_5678u64;
+        let mut r = || { s = s.wrapping_add(0x9E37_79B9_7F4A_7C15); let mut z = s; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9); z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^ (z >> 31) };
+        for _ in 0..3_000_000 {
+            let y = match r() % 5 { 0 => (r() % 10000) as i64, 1 => 1899 + (r() % 3) as i64, 2 => 2299 + (r() % 3) as i64, _ => 2024 + (r() % 6) as i64 };
+            let pick = |r: &mut dyn FnMut() -> u64, lo: u64, hi: u64| if r() % 6 == 0 { r() % 100 } else { lo + r() % (hi - lo + 1) };
+            let (mo, d, h, mi, se) = (pick(&mut r, 1, 12), pick(&mut r, 27, 31), pick(&mut r, 0, 23), pick(&mut r, 0, 59), pick(&mut r, 0, 59));
+            let mut v = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}Z").into_bytes();
+            if r() % 8 == 0 { let i = (r() % 20) as usize; v[i] = (r() & 0xFF) as u8; }
+            check(&v);
         }
     }
 }
