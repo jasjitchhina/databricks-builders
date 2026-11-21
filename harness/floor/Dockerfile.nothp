@@ -1,0 +1,3 @@
+FROM bench-rev-496a5fd:latest
+COPY nothp /app/nothp
+CMD ["/app/nothp","/app/fast"]
