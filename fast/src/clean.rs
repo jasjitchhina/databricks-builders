@@ -1,8 +1,9 @@
 //! Parse + clean + dedup + link: DATA_DIR -> model::Cleaned.
 
-use crate::csv::{self, pack_in, Chunk};
 use crate::alloc::WcRegions;
-use crate::ids::{self, hk, key_bytes, key_cmp, pack, prefetch, Key, KeyMap, ShardedMap, NPART};
+use crate::csv::{self, pack_in, Chunk};
+use crate::ids::{key_cmp, pack, Key, KeyMap, NPART};
+use crate::keys::{part_of, GMap, GSharded, IdKey};
 use crate::model::{Cl, Cleaned, Ev, Part};
 use crate::ts::{parse_ts, DAY_MS};
 use memmap2::Mmap;
@@ -96,9 +97,9 @@ fn data_lines(p: &Path, mut f: impl FnMut(&[u8])) {
 
 /// A parsed, well-formed event line with a non-empty event_id.
 #[derive(Clone, Copy)]
-struct ERec {
-    eid: Key,
-    user: Key,
+struct ERec<K: IdKey> {
+    eid: K,
+    user: K,
     ingest: i64,
     /// ts - base, or NOT_OK if the copy fails validation / is late.
     ts: u32,
@@ -107,16 +108,16 @@ struct ERec {
 }
 
 #[derive(Clone, Copy)]
-struct CRec {
-    cid: Key,
-    person: Key,
+struct CRec<K: IdKey> {
+    cid: K,
+    person: K,
     ts: u32,
     camp: u16,
 }
 
 #[derive(Clone, Copy)]
-struct PRec {
-    person: Key,
+struct PRec<K: IdKey> {
+    person: K,
     ts: u32,
     price: u32,
     cat: u16,
@@ -135,36 +136,47 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 const LS: usize = 256; // link shards (== ShardedMap shards)
 
 /// Union-find over all link lines; returns id -> name for every linked id
-/// whose name is not itself.
-fn build_links(dir: &Path, threads: usize) -> ShardedMap {
+/// whose name is not itself. None: an ID is not representable as K.
+fn build_links<K: IdKey>(dir: &Path, threads: usize) -> Option<GSharded<K>> {
     let mut t = timer();
     let files = csv::list_csv(&dir.join("links"));
     let maps: Vec<Option<Mmap>> = files.iter().map(|p| csv::map(p)).collect();
     let chunks = csv::chunks(&maps, 1 << 20);
-    // per thread: endpoints (key) in order: pair j = (2j, 2j+1); and shard buckets of (key, endpoint ref)
-    struct LS_ {
+    let bad = AtomicBool::new(false);
+    // per thread: endpoints in order (pair j = endpoints 2j, 2j+1), bucketed by shard as (key, endpoint ref)
+    struct LS_<K> {
         n_ep: u32,
         t: u32,
-        shards: Vec<Vec<(Key, u32)>>,
+        shards: Vec<Vec<(K, u32)>>,
     }
     let per = par_items(
         threads,
         chunks.len(),
-        |t| LS_ { n_ep: 0, t: t as u32, shards: (0..LS).map(|_| Vec::new()).collect() },
+        |t| LS_::<K> { n_ep: 0, t: t as u32, shards: (0..LS).map(|_| Vec::new()).collect() },
         |st, i| {
+            if bad.load(Ordering::Relaxed) {
+                return;
+            }
             let c = chunks[i];
             let m: &[u8] = maps[c.file].as_ref().unwrap();
             csv::scan_fast::<2, _>(m, c.start, c.end, |[a, b]| {
                 if !a.is_empty() && !b.is_empty() && a != b {
-                    for k in [pack_in(m, a), pack_in(m, b)] {
+                    let (Some(ka), Some(kb)) = (K::pack(m, a), K::pack(m, b)) else {
+                        bad.store(true, Ordering::Relaxed);
+                        return;
+                    };
+                    for k in [ka, kb] {
                         let r = (st.t << 27) | st.n_ep;
                         st.n_ep += 1;
-                        st.shards[ShardedMap::shard_of(k)].push((k, r));
+                        st.shards[GSharded::<K>::shard_of(k)].push((k, r));
                     }
                 }
             });
         },
     );
+    if bad.load(Ordering::Relaxed) {
+        return None;
+    }
     t(" L parse");
     assert!(per.iter().all(|p| p.n_ep < (1 << 27)));
     // endpoint -> gid, written by shard tasks
@@ -174,26 +186,24 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             (0..n).map(|_| AtomicU32::new(0)).collect()
         })
         .collect();
-    let per_by_t: Vec<&LS_> = {
-        let mut v: Vec<&LS_> = per.iter().collect();
+    let per_by_t: Vec<&LS_<K>> = {
+        let mut v: Vec<&LS_<K>> = per.iter().collect();
         v.sort_by_key(|p| p.t);
         v
     };
     // per shard: intern -> local ids, keys
-    let shard_keys: Vec<Mutex<Vec<Key>>> = (0..LS).map(|_| Mutex::new(Vec::new())).collect();
+    let shard_keys: Vec<Mutex<Vec<K>>> = (0..LS).map(|_| Mutex::new(Vec::new())).collect();
     par_items(threads, LS, |_| (), |_, s| {
         let n: usize = per_by_t.iter().map(|p| p.shards[s].len()).sum();
-        let mut tab = KeyMap::with_capacity(n);
+        let mut tab: GMap<K, u32> = GMap::with_capacity(n);
         let mut keys = Vec::with_capacity(n / 2 + 1);
         for p in &per_by_t {
             for &(k, r) in &p.shards[s] {
-                let local = match tab.get(k) {
-                    Some(v) => v as u32,
+                let local = match tab.get_or_insert(k, keys.len() as u32) {
+                    Some(v) => v,
                     None => {
-                        let v = keys.len() as u32;
                         keys.push(k);
-                        tab.insert(k, v as Key);
-                        v
+                        (keys.len() - 1) as u32
                     }
                 };
                 ep[(r >> 27) as usize][(r & ((1 << 27) - 1)) as usize].store(((s as u32) << 24) | local, Ordering::Relaxed);
@@ -202,7 +212,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
         assert!(keys.len() < (1 << 24));
         *shard_keys[s].lock().unwrap() = keys;
     });
-    let shard_keys: Vec<Vec<Key>> = shard_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let shard_keys: Vec<Vec<K>> = shard_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
     t(" L intern");
     let mut base = vec![0u32; LS + 1];
     for s in 0..LS {
@@ -210,7 +220,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
     }
     let m = base[LS] as usize;
     let gid = |x: u32| base[(x >> 24) as usize] + (x & 0xFF_FFFF);
-    let mut keys: Vec<Key> = Vec::with_capacity(m);
+    let mut keys: Vec<K> = Vec::with_capacity(m);
     for sk in &shard_keys {
         keys.extend_from_slice(sk);
     }
@@ -224,7 +234,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
             let ra = find(&mut parent, a);
             let rb = find(&mut parent, b);
             if ra != rb {
-                if key_cmp(keys[ra as usize], keys[rb as usize]) == std::cmp::Ordering::Less {
+                if K::less(keys[ra as usize], keys[rb as usize]) {
                     parent[rb as usize] = ra;
                 } else {
                     parent[ra as usize] = rb;
@@ -235,7 +245,7 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
     t(" L unionfind");
     let parent = &parent;
     let keys = &keys;
-    let lists: Vec<Mutex<Vec<(Key, Key)>>> = (0..LS).map(|_| Mutex::new(Vec::new())).collect();
+    let lists: Vec<Mutex<Vec<(K, K)>>> = (0..LS).map(|_| Mutex::new(Vec::new())).collect();
     par_items(threads, LS, |_| (), |_, s| {
         let mut v = Vec::new();
         for i in base[s] as usize..base[s + 1] as usize {
@@ -249,16 +259,16 @@ fn build_links(dir: &Path, threads: usize) -> ShardedMap {
         }
         *lists[s].lock().unwrap() = v;
     });
-    let lists: Vec<Vec<(Key, Key)>> = lists.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let lists: Vec<Vec<(K, K)>> = lists.into_iter().map(|m| m.into_inner().unwrap()).collect();
     t(" L names");
-    let map = ShardedMap::new(lists.iter().map(|v| v.len()).max().unwrap_or(0));
+    let map = GSharded::<K>::new(lists.iter().map(|v| v.len()).max().unwrap_or(0));
     par_items(threads, LS, |_| (), |_, s| {
         for &(k, nm) in &lists[s] {
             unsafe { map.insert_shard(s, k, nm) };
         }
     });
     t(" L map");
-    map
+    Some(map)
 }
 
 struct Lookups {
@@ -267,20 +277,56 @@ struct Lookups {
     campaigns: KeyMap, // campaign key -> idx
 }
 
-struct ParseState {
-    ev: WcRegions<ERec, 4>,
+struct ParseState<K: IdKey> {
+    ev: WcRegions<ERec<K>, 4>,
     side: Vec<(u32, u16)>,
-    cl: WcRegions<CRec, 4>,
-    cbuf: Vec<CRec>,
+    cl: WcRegions<CRec<K>, 8>,
+    cbuf: Vec<CRec<K>>,
 }
 
 #[inline(always)]
-fn person_of(links: &ShardedMap, user: Key) -> Key {
+fn person_of<K: IdKey>(links: &GSharded<K>, user: K) -> K {
     links.get(user).unwrap_or(user)
 }
 
+struct Small {
+    ws: i64,
+    we: i64,
+    base: i64,
+    lk: Lookups,
+    cat_names: Vec<Box<[u8]>>,
+    camp_ids: Vec<Box<[u8]>>,
+    camp_channels: Vec<Box<[u8]>>,
+}
+
+static WIDE_USED: AtomicBool = AtomicBool::new(false);
+
+/// Bytes of a `Cl::click_id` from the last `clean` call (dump/debug tool).
+pub fn click_id_bytes(k: u128) -> Box<[u8]> {
+    if WIDE_USED.load(Ordering::Relaxed) {
+        crate::ids::key_bytes(k)
+    } else {
+        (k as u64).bytes()
+    }
+}
+
 pub fn clean(dir: &Path, threads: usize) -> Cleaned {
-    let mut t = timer();
+    let small = read_small(dir);
+    WIDE_USED.store(false, Ordering::Relaxed);
+    if std::env::var_os("FAST_WIDE").is_none() {
+        if let Some(c) = clean_impl::<u64>(dir, threads, &small) {
+            return c;
+        }
+        WIDE_USED.store(true, Ordering::Relaxed);
+        if std::env::var_os("FAST_VERBOSE").is_some() {
+            eprintln!("[clean] an ID is not compact: rerunning with u128 keys");
+        }
+    }
+    WIDE_USED.store(true, Ordering::Relaxed);
+    clean_impl::<u128>(dir, threads, &small).expect("u128 keys represent every ID")
+}
+
+fn read_small(dir: &Path) -> Small {
     let (ws, we) = read_manifest(&dir.join("manifest.json"));
     let base = ws - 7 * DAY_MS;
 
@@ -316,9 +362,15 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         campaigns.insert(pack(c), i as Key);
     }
     let lk = Lookups { products, unknown_cat, campaigns };
-    t("small files");
+    Small { ws, we, base, lk, cat_names, camp_ids, camp_channels }
+}
 
-    let links = build_links(dir, threads);
+fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cleaned> {
+    let mut t = timer();
+    let (ws, we, base, lk) = (small.ws, small.we, small.base, &small.lk);
+    let unknown_cat = lk.unknown_cat;
+    let bad = AtomicBool::new(false);
+    let links = build_links::<K>(dir, threads)?;
     t("links");
 
     // events + clicks
@@ -342,26 +394,34 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     let states = par_items(
         threads,
         chunks.len(),
-        |_| ParseState {
+        |_| ParseState::<K> {
             ev: WcRegions::new_with(NB, ev_cap, huge),
             side: Vec::with_capacity(ev_cap * NB / 20),
             cl: WcRegions::new_with(NPART, cl_cap, huge),
             cbuf: Vec::new(),
         },
         |st, i| {
+            if bad.load(Ordering::Relaxed) {
+                return;
+            }
             let c = chunks[i];
             let m: &[u8] = maps[c.file].as_ref().unwrap();
             let _fence = Defer(crate::alloc::sfence);
             let _t0 = Instant::now();
             let _g = Defer(|| { let ns = _t0.elapsed().as_nanos() as usize; if c.file < n_ev_files { EV_NS.fetch_add(ns, Ordering::Relaxed); } else { CL_NS.fetch_add(ns, Ordering::Relaxed); } });
             if c.file < n_ev_files {
-                csv::scan_fast::<7, _>(m, c.start, c.end, |f| {
-                    if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut st.side) {
-                        st.ev.push(bucket_of(&r), r);
-                    }
+                let mut ok = true;
+                csv::scan_fast::<7, _>(m, c.start, c.end, |f| match parse_event::<K>(m, f, ws, we, base, lk, &mut st.side) {
+                    Ok(Some(r)) => st.ev.push(bucket_of(&r), r),
+                    Ok(None) => {}
+                    Err(()) => ok = false,
                 });
+                if !ok {
+                    bad.store(true, Ordering::Relaxed);
+                }
             } else {
                 st.cbuf.clear();
+                let mut ok = true;
                 csv::scan_fast::<4, _>(m, c.start, c.end, |[cid, user, camp, ts]| {
                     if cid.is_empty() || user.is_empty() {
                         return;
@@ -371,13 +431,19 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                         return;
                     }
                     let Some(ci) = lk.campaigns.get(pack_in(m, camp)) else { return };
-                    let ck = pack_in(m, cid);
-                    if ids::is_long(ck) {
+                    let (Some(ck), Some(uk)) = (K::pack(m, cid), K::pack(m, user)) else {
+                        ok = false;
+                        return;
+                    };
+                    if ck.is_long() {
                         long_click.store(true, Ordering::Relaxed);
                     }
                     // person resolved below (batched with prefetch); hold the user key for now
-                    st.cbuf.push(CRec { cid: ck, person: pack_in(m, user), ts: (t - base) as u32, camp: ci as u16 });
+                    st.cbuf.push(CRec { cid: ck, person: uk, ts: (t - base) as u32, camp: ci as u16 });
                 });
+                if !ok {
+                    bad.store(true, Ordering::Relaxed);
+                }
                 let n = st.cbuf.len();
                 for j in 0..n {
                     if j + PF < n {
@@ -385,15 +451,22 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                     }
                     let mut r = st.cbuf[j];
                     r.person = person_of(&links, r.person);
-                    st.cl.push(ids::part_of(r.person), r);
+                    st.cl.push(part_of(r.person), r);
                 }
             }
         },
     );
     if std::env::var_os("FAST_VERBOSE").is_some() { eprintln!("[clean]   cpu: events {:.1} ms, clicks {:.1} ms", EV_NS.load(Ordering::Relaxed) as f64 / 1e6, CL_NS.load(Ordering::Relaxed) as f64 / 1e6); }
-    let mut states = std::mem::ManuallyDrop::new(states);
+    if bad.load(Ordering::Relaxed) {
+        // not representable as K: leak (cheaper than freeing) and let the caller rerun wider
+        std::mem::forget(states);
+        std::mem::forget(maps);
+        std::mem::forget(links);
+        return None;
+    }
+    let states = std::mem::ManuallyDrop::new(states);
     par_items(threads, states.len(), |_| (), |_, i| {
-        let st = unsafe { &mut *((*states).as_ptr().add(i) as *mut ParseState) };
+        let st = unsafe { &mut *((*states).as_ptr().add(i) as *mut ParseState<K>) };
         st.ev.finish();
         st.cl.finish();
     });
@@ -405,7 +478,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     let deduped = par_items(
         threads,
         NB,
-        |_| (Vec::<u64>::new(), Vec::<(Key, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec, 4>::new_with(NPART, out_cap, huge)),
+        |_| (Vec::<u64>::new(), Vec::<(K, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec<K>, 8>::new_with(NPART, out_cap, huge)),
         |(table, surv, losers, out), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
@@ -416,11 +489,11 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             table.clear();
             table.resize(cap, 0);
             let mask = cap - 1;
-            let get = |r: u32| -> &ERec { unsafe { states.get_unchecked((r >> 26) as usize) }.ev.at(b, (r & ((1 << 26) - 1)) as usize) };
+            let get = |r: u32| -> &ERec<K> { unsafe { states.get_unchecked((r >> 26) as usize) }.ev.at(b, (r & ((1 << 26) - 1)) as usize) };
             losers.clear();
             for (ti, s) in states.iter().enumerate() {
                 s.ev.each(b, |ri, r| {
-                    let h = hk(r.eid);
+                    let h = r.eid.hash();
                     let tag = h >> 32;
                     let mut i = (h >> NB_BITS) as usize & mask;
                     let me = ((ti as u32) << 26) | ri as u32;
@@ -471,7 +544,7 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
                 }
                 let (user, ts, price, cat) = surv[j];
                 let person = person_of(&links, user);
-                out.push(ids::part_of(person), PRec { person, ts, price, cat });
+                out.push(part_of(person), PRec { person, ts, price, cat });
             }
         },
     );
@@ -488,18 +561,16 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
         let parts_ref = &parts_out;
         par_items(threads, NPART, |_| (), |_, p| {
             let n: usize = deduped.iter().map(|(_, _, _, o)| o.len_of(p)).sum();
-            let mut local = KeyMap::with_capacity(1024);
-            let mut names: Vec<Key> = Vec::new();
+            let mut local: GMap<K, u32> = GMap::with_capacity(1024);
+            let mut names: Vec<K> = Vec::new();
             let mut ev: Vec<Ev> = Vec::with_capacity(n);
             for (_, _, _, o) in deduped.iter() {
                 o.each(p, |_, r| {
-                    let id = match local.get(r.person) {
-                        Some(v) => v as u32,
+                    let id = match local.get_or_insert(r.person, names.len() as u32) {
+                        Some(v) => v,
                         None => {
-                            let v = names.len() as u32;
                             names.push(r.person);
-                            local.insert(r.person, v as Key);
-                            v
+                            (names.len() - 1) as u32
                         }
                     };
                     ev.push(Ev { person: id, ts: r.ts, price: r.price, cat: r.cat });
@@ -509,11 +580,11 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
             for s in states.iter() {
                 s.cl.each(p, |_, r| {
                     if let Some(v) = local.get(r.person) {
-                        cl.push(Cl { click_id: r.cid, person: v as u32, ts: r.ts, camp: r.camp });
+                        cl.push(Cl { click_id: r.cid.click(), person: v, ts: r.ts, camp: r.camp });
                     }
                 });
             }
-            let person_names = names.into_iter().map(key_bytes).collect();
+            let person_names = names.into_iter().map(|k| k.bytes()).collect();
             *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
         });
     }
@@ -530,7 +601,16 @@ pub fn clean(dir: &Path, threads: usize) -> Cleaned {
     std::mem::forget(links);
     std::mem::forget(maps);
     t("leak");
-    Cleaned { base_ms: base, ws_ms: ws, we_ms: we, cat_names, unknown_cat, camp_ids, camp_channels, parts }
+    Some(Cleaned {
+        base_ms: base,
+        ws_ms: ws,
+        we_ms: we,
+        cat_names: small.cat_names.clone(),
+        unknown_cat,
+        camp_ids: small.camp_ids.clone(),
+        camp_channels: small.camp_channels.clone(),
+        parts,
+    })
 }
 
 /// Some click_id is longer than 15 bytes: replace every click_id key by its
@@ -574,15 +654,16 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     }
 }
 
+/// Ok(None): malformed for dedup purposes (empty event_id). Err: an ID is not representable as K.
 #[inline(always)]
-fn parse_event(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookups, side: &mut Vec<(u32, u16)>) -> Option<ERec> {
+fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookups, side: &mut Vec<(u32, u16)>) -> Result<Option<ERec<K>>, ()> {
     let [eid, user, ts, ing, typ, prod, price] = f;
     if eid.is_empty() {
-        return None;
+        return Ok(None);
     }
     let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-    let ek = pack_in(m, eid);
-    let mut rec = ERec { eid: ek, user: 0, ingest, ts: NOT_OK, pc: 0 };
+    let Some(ek) = K::pack(m, eid) else { return Err(()) };
+    let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0 };
     'v: {
         if user.is_empty() || prod.is_empty() {
             break 'v;
@@ -594,25 +675,27 @@ fn parse_event(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookup
         if ingest == i64::MAX || ingest - t > DAY_MS {
             break 'v;
         }
-        match typ {
-            b"view" | b"cart" => {}
+        let pc = match typ {
+            b"view" | b"cart" => 0,
             b"purchase" => {
                 let Some(p) = parse_price(price) else { break 'v };
                 let cat = lk.products.get(pack_in(m, prod)).map_or(lk.unknown_cat, |c| c as u16);
                 side.push((p, cat));
-                rec.pc = side.len() as u32;
+                side.len() as u32
             }
             _ => break 'v,
-        }
-        rec.user = pack_in(m, user);
+        };
+        let Some(uk) = K::pack(m, user) else { return Err(()) };
+        rec.user = uk;
+        rec.pc = pc;
         rec.ts = (t - base) as u32;
     }
-    Some(rec)
+    Ok(Some(rec))
 }
 
 #[inline(always)]
-fn bucket_of(r: &ERec) -> usize {
-    (hk(r.eid) & (NB as u64 - 1)) as usize
+fn bucket_of<K: IdKey>(r: &ERec<K>) -> usize {
+    (r.eid.hash() & (NB as u64 - 1)) as usize
 }
 
 /// Single-thread microbenchmark of the event parse path over in-memory files
@@ -661,80 +744,25 @@ pub fn microbench(dir: &Path) {
     });
     run("scan+ts", &mut || {
         let mut x = 0u64;
-        csv::scan::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64));
+        csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts(f[2]).unwrap_or(0) as u64 ^ parse_ts(f[3]).unwrap_or(0) as u64));
         x
     });
-    run("scan+pack", &mut || {
-        let mut x = 0u64;
-        csv::scan::<7, _>(m, 0, n, |f| x = x.wrapping_add(hk(pack_in(m, f[0])) ^ pack_in(m, f[1]) as u64));
-        x
-    });
-    run("noout", &mut || {
+    fn noout<K: IdKey>(m: &[u8], n: usize, ws: i64, we: i64, base: i64, lk: &Lookups) -> u64 {
         let mut side = Vec::new();
         let mut x = 0u64;
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { x = x.wrapping_add(r.ts as u64 ^ r.user as u64 ^ r.eid as u64 ^ r.ingest as u64) });
+        csv::scan_fast::<7, _>(m, 0, n, |f| if let Ok(Some(r)) = parse_event::<K>(m, f, ws, we, base, lk, &mut side) { x = x.wrapping_add(r.ts as u64 ^ r.user.hash() ^ r.eid.hash() ^ r.ingest as u64) });
         x
-    });
+    }
+    run("noout-u64", &mut || noout::<u64>(m, n, ws, we, base, &lk));
+    run("noout-u128", &mut || noout::<u128>(m, n, ws, we, base, &lk));
     let cap = lines / NB * 5 / 4 + 64;
-    run("vecs", &mut || {
+    fn wc<K: IdKey>(m: &[u8], n: usize, ws: i64, we: i64, base: i64, lk: &Lookups, cap: usize, huge: bool) -> u64 {
         let mut side = Vec::new();
-        let mut ev: Vec<Vec<ERec>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { unsafe { ev.get_unchecked_mut(bucket_of(&r)) }.push(r) });
-        ev.iter().map(|v| v.len() as u64).sum()
-    });
-    let mut reuse: Vec<Vec<ERec>> = (0..NB).map(|_| Vec::with_capacity(cap)).collect();
-    run("vecs-warm", &mut || {
-        let mut side = Vec::new();
-        for v in reuse.iter_mut() { v.clear(); }
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { unsafe { reuse.get_unchecked_mut(bucket_of(&r)) }.push(r) });
-        reuse.iter().map(|v| v.len() as u64).sum()
-    });
-    run("regions", &mut || {
-        let mut side = Vec::new();
-        let mut ev = crate::alloc::Regions::<ERec>::new(NB, cap);
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { ev.push(bucket_of(&r), r) });
-        (0..NB).map(|b| ev.len_of(b) as u64).sum()
-    });
-    let mut rw = crate::alloc::Regions::<ERec>::new_with(NB, cap, false);
-    run("regions-warm", &mut || {
-        let mut side = Vec::new();
-        rw.clear();
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { rw.push(bucket_of(&r), r) });
-        (0..NB).map(|b| rw.len_of(b) as u64).sum()
-    });
-    let mut wc = crate::alloc::WcRegions::<ERec, 4>::new(NB, cap);
-    run("wc-warm", &mut || {
-        let mut side = Vec::new();
-        wc.clear();
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { wc.push(bucket_of(&r), r) });
+        let mut wc = crate::alloc::WcRegions::<ERec<K>, 4>::new_with(NB, cap, huge);
+        csv::scan_fast::<7, _>(m, 0, n, |f| if let Ok(Some(r)) = parse_event::<K>(m, f, ws, we, base, lk, &mut side) { wc.push(bucket_of(&r), r) });
         wc.finish();
         (0..NB).map(|b| wc.len_of(b) as u64).sum()
-    });
-    run("wc-fresh", &mut || {
-        let mut side = Vec::new();
-        let mut wc = crate::alloc::WcRegions::<ERec, 4>::new(NB, cap);
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { wc.push(bucket_of(&r), r) });
-        wc.finish();
-        (0..NB).map(|b| wc.len_of(b) as u64).sum()
-    });
-    run("wc-huge", &mut || {
-        let mut side = Vec::new();
-        let mut wc = crate::alloc::WcRegions::<ERec, 4>::new_with(NB, cap, true);
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { wc.push(bucket_of(&r), r) });
-        wc.finish();
-        (0..NB).map(|b| wc.len_of(b) as u64).sum()
-    });
-    let mut sw: Vec<ERec> = Vec::with_capacity(lines);
-    run("seq-warm", &mut || {
-        let mut side = Vec::new();
-        sw.clear();
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { sw.push(r) });
-        sw.len() as u64
-    });
-    run("seq", &mut || {
-        let mut side = Vec::new();
-        let mut ev: Vec<ERec> = Vec::with_capacity(lines);
-        csv::scan_fast::<7, _>(m, 0, n, |f| if let Some(r) = parse_event(m, f, ws, we, base, &lk, &mut side) { ev.push(r) });
-        ev.len() as u64
-    });
+    }
+    run("wc-u64", &mut || wc::<u64>(m, n, ws, we, base, &lk, cap, true));
+    run("wc-u128", &mut || wc::<u128>(m, n, ws, we, base, &lk, cap, true));
 }

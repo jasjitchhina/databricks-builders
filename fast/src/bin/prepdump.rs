@@ -41,7 +41,7 @@ fn main() {
             ev.push(format!("{},{},{},{}", s(&p.person_names[e.person as usize]), e.ts as i64 + c.base_ms, e.price, cat));
         }
         for k in &p.cl {
-            ids.entry(k.click_id).or_insert_with(|| fast::ids::key_bytes(k.click_id).into());
+            ids.entry(k.click_id).or_insert_with(|| fast::clean::click_id_bytes(k.click_id).into());
             cl.push(format!("{},{},{},{}", s(&ids[&k.click_id]), s(&p.person_names[k.person as usize]), s(&c.camp_ids[k.camp as usize]), k.ts as i64 + c.base_ms));
         }
     }
