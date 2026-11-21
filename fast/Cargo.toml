@@ -15,6 +15,7 @@ default = ["mimalloc"]
 huge = []
 hugealloc = []
 mimalloc = ["dep:mimalloc"]
+cov = []
 
 [profile.release]
 opt-level = 3
