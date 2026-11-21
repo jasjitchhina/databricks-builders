@@ -334,6 +334,19 @@ pub fn parse_ts_in(m: &[u8], b: &[u8]) -> Option<i64> {
         20 if b[19] == b'Z' => return unsafe { civil19_v2(b.as_ptr()) },
         #[cfg(not(target_feature = "avx2"))]
         20 if b[19] == b'Z' => return civil19(b),
+        #[cfg(target_feature = "avx2")]
+        25 if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' => {
+            // F2: the SIMD F1 core validates bytes 0..19 exactly like civil19
+            let t = unsafe { civil19_v2(b.as_ptr()) }?;
+            let oh = d2(b, 20)?;
+            let om = d2(b, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 60 + om) * 60_000;
+            return Some(if b[19] == b'+' { t - off } else { t + off });
+        }
+        #[cfg(not(target_feature = "avx2"))]
         25 if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' => return parse_ts(b),
         _ => {}
     }
