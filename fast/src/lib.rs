@@ -2,6 +2,7 @@ pub mod alloc;
 pub mod clean;
 pub mod csv;
 pub mod engine;
+pub mod gid;
 pub mod ids;
 pub mod keys;
 pub mod loader;
