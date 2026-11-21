@@ -9,7 +9,13 @@
 # via bench.sh (exclusive lock, CPUs 0-7); a note is posted only if either regresses >5% vs the previous landing.
 # Everything except bench.sh runs on CPUs $SOAK_CPUS (default 12-15,28-31).
 set -uo pipefail
-H=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$H")
+H=$(cd "$(dirname "$0")" && pwd); ROOT=${SOAK_ROOT:-$(dirname "$H")}
+# run from a private copy so editing harness/soak.sh never corrupts the running loop
+if [ -z "${SOAK_COPY:-}" ]; then
+  mkdir -p "$HOME/data/soak"; cp "$0" "$HOME/data/soak/run.sh"
+  SOAK_COPY=1 SOAK_ROOT="$ROOT" SOAK_H="$H" exec bash "$HOME/data/soak/run.sh" "$@"
+fi
+H=${SOAK_H:-$H}
 D=$HOME/data/soak; mkdir -p "$D"
 DB=/home/jessechhina/databricks-builders/team.db
 CPUS=${SOAK_CPUS:-12-15,28-31}; WORKERS=${WORKERS:-3}
@@ -50,8 +56,9 @@ bench_landing() {  # no-THP + cold bench of main $1 (20M), compare with previous
 
 one_seed() {  # one_seed SEED SHA
   local seed=$1 sha=$2 R=$D/w-$1 ev cl rc=0
-  ev=$(( 600000 + (seed * 7919 % 900001) ))            # 0.6M..1.5M events
-  cl=$(( ev / (2 + seed % 7) ))                         # clicks = events/2 .. events/8
+  local h; h=$(printf '%s' "$seed" | cksum | cut -d' ' -f1)
+  ev=$(( 600000 + h % 900001 ))                         # 0.6M..1.5M events, hashed per seed
+  cl=$(( ev / (2 + (h / 900001) % 7) ))                 # clicks = events/2 .. events/8
   rm -rf "$R"; mkdir -p "$R"
   taskset -c "$CPUS" "$GEN" --seed "$seed" --events "$ev" --clicks "$cl" --output "$R/data" >/dev/null 2>&1 || { log "seed $seed: generate failed"; return; }
   taskset -c "$CPUS" "$D/bin/$sha/oracle.sh" "$R/data" "$R/oracle" > "$R/oracle.log" 2>&1 || { log "seed $seed: ORACLE CRASH"; note "SOAK: oracle crashed on seed $seed ($ev/$cl); data kept at $D/fail-$seed"; mv "$R" "$D/fail-$seed"; return; }
