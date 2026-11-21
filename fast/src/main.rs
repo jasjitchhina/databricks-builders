@@ -85,31 +85,26 @@ fn prefetch_inputs(data: &std::path::Path) {
         v.sort();
         files.extend(v);
     }
-    // split files into 8MB ranges, issued by several threads to keep the device queue deep
+    // several threads keep the device queue deep; each opens, advises (8MB ranges) and
+    // closes one file at a time so at most `nt` descriptors are ever held (EMFILE-safe)
     let nt: usize = std::env::var("FAST_PF_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-    let mut ranges: Vec<(std::sync::Arc<std::fs::File>, i64, i64)> = vec![];
-    for p in files {
-        if let Ok(f) = std::fs::File::open(&p) {
-            let len = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
-            let f = std::sync::Arc::new(f);
-            let mut o = 0;
-            while o < len {
-                let l = (8 << 20).min(len - o);
-                ranges.push((f.clone(), o, l));
-                o += l;
-            }
-        }
-    }
-    let ranges = std::sync::Arc::new(ranges);
+    let files = std::sync::Arc::new(files);
     let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for _ in 0..nt {
-        let (ranges, next) = (ranges.clone(), next.clone());
+        let (files, next) = (files.clone(), next.clone());
         std::thread::spawn(move || {
             use std::os::unix::io::AsRawFd;
             loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some((f, o, l)) = ranges.get(i) else { break };
-                unsafe { libc::posix_fadvise(f.as_raw_fd(), *o, *l, libc::POSIX_FADV_WILLNEED) };
+                let Some(p) = files.get(i) else { break };
+                let Ok(f) = std::fs::File::open(p) else { continue };
+                let len = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+                let mut o = 0;
+                while o < len {
+                    let l = (8i64 << 20).min(len - o);
+                    unsafe { libc::posix_fadvise(f.as_raw_fd(), o, l, libc::POSIX_FADV_WILLNEED) };
+                    o += l;
+                }
             }
         });
     }
