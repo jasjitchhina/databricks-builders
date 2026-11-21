@@ -376,6 +376,14 @@ impl<T: Copy, const K: usize> WcRegions<T, K> {
             std::arch::x86_64::_mm_sfence()
         };
     }
+    /// The whole backing buffer (base, bytes), e.g. to recycle it once the
+    /// regions are dead.
+    pub fn raw(&self) -> (*mut u8, usize) {
+        match &self._hbuf {
+            Some(h) => (h.as_mut_ptr(), h.len()),
+            None => (self._vbuf.as_ptr() as *mut u8, self._vbuf.capacity()),
+        }
+    }
     pub fn clear(&mut self) {
         self.len.iter_mut().for_each(|l| *l = 0);
         self.nst.iter_mut().for_each(|l| *l = 0);
@@ -469,5 +477,34 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Bump allocator over recycled (already faulted-in) memory.
+pub struct Bump {
+    p: usize,
+    end: usize,
+}
+
+unsafe impl Send for Bump {}
+
+impl Bump {
+    /// # Safety: [base, base+len) must be writable and unused for the Bump's lifetime (and beyond: slices are 'static).
+    pub unsafe fn new(base: *mut u8, len: usize) -> Self {
+        Bump { p: base as usize, end: base as usize + len }
+    }
+    /// Uninitialized room for n Ts, or None if the bump is exhausted.
+    pub fn take<T>(&mut self, n: usize) -> Option<*mut T> {
+        let a = (self.p + 63) & !63;
+        let need = n * std::mem::size_of::<T>();
+        if a + need > self.end {
+            return None;
+        }
+        self.p = a + need;
+        Some(a as *mut T)
+    }
+    /// Gives back the tail of the last `take` (used < taken).
+    pub fn shrink_last<T>(&mut self, at: *mut T, used: usize) {
+        self.p = at as usize + used * std::mem::size_of::<T>();
     }
 }

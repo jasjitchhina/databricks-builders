@@ -64,6 +64,79 @@ fn digits_ok(x: u64, m: u64) -> bool {
 /// Parses `YYYY-MM-DDTHH:MM:SS` (first 19 bytes of b, b.len() >= 20) to epoch ms, validating the calendar.
 #[inline(always)]
 fn civil19(b: &[u8]) -> Option<i64> {
+    #[cfg(target_feature = "avx2")]
+    {
+        return unsafe { civil19_simd(b.as_ptr()) };
+    }
+    #[allow(unreachable_code)]
+    civil19_swar(b)
+}
+
+/// SSE version of `civil19_swar` (reads bytes 0..20 of p).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn civil19_simd(p: *const u8) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let lo = _mm_loadu_si128(p as *const __m128i); // bytes 0..16
+    let hi = _mm_loadu_si128(p.add(4) as *const __m128i); // bytes 4..20
+    // separators: '-' at 4, 7; 'T' at 10; ':' at 13 (lo) and 16 (hi offset 12)
+    let sep_lo = _mm_shuffle_epi8(lo, _mm_setr_epi8(4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    let sep_hi = _mm_shuffle_epi8(hi, _mm_setr_epi8(-1, -1, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+    let sep = _mm_or_si128(sep_lo, sep_hi);
+    let want = _mm_setr_epi8(b'-' as i8, b'-' as i8, b'T' as i8, b':' as i8, b':' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(sep, want)) != 0xFFFF {
+        return None;
+    }
+    // digits Y0..Y3 M0 M1 D0 D1 H0 H1 (lo: 0,1,2,3,5,6,8,9,11,12) m0 m1 S0 S1 (hi: 10,11,13,14)
+    let dl = _mm_shuffle_epi8(lo, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, -1, -1, -1, -1, -1, -1));
+    let dh = _mm_shuffle_epi8(hi, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 13, 14, -1, -1));
+    let dig = _mm_or_si128(dl, dh);
+    // lanes 14, 15 are 0; make them '0' so they pass the digit check
+    let dig = _mm_or_si128(dig, _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'0' as i8, b'0' as i8));
+    let d = _mm_sub_epi8(dig, _mm_set1_epi8(b'0' as i8));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+        return None;
+    }
+    // pairs -> u16: [Y0Y1, Y2Y3, MM, DD, hh, mm, ss, 0]
+    let v = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let y = _mm_extract_epi16(v, 0) as i64 * 100 + _mm_extract_epi16(v, 1) as i64;
+    let mo = _mm_extract_epi16(v, 2) as i64;
+    let dd = _mm_extract_epi16(v, 3) as i64;
+    let h = _mm_extract_epi16(v, 4) as i64;
+    let mi = _mm_extract_epi16(v, 5) as i64;
+    let s = _mm_extract_epi16(v, 6) as i64;
+    finish_civil(y, mo, dd, h, mi, s)
+}
+
+#[inline(always)]
+fn finish_civil(y: i64, mo: i64, dd: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+    if !(1..=12).contains(&mo) || dd < 1 || h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+    let days = if (YMIN..YMIN + YN as i64).contains(&y) {
+        let t = &*TABLES;
+        let i = (y - YMIN) as usize * 12 + mo as usize - 1;
+        if dd > t.mlen[i] as i64 {
+            return None;
+        }
+        t.days[i] as i64 + dd - 1
+    } else {
+        let mdays = match mo {
+            2 => if is_leap(y) { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if dd > mdays {
+            return None;
+        }
+        days_from_civil(y, mo, dd)
+    };
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1000)
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn civil19_swar(b: &[u8]) -> Option<i64> {
     let a = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
     let c = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
     let e = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64 & 0x00FF_FFFF; // :SS
