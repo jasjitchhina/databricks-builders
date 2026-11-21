@@ -54,6 +54,7 @@ struct Scratch {
     cls: Vec<Cl>,
     pevs: Vec<PEv>,
     pcls: Vec<PCl>,
+    rtmp: Vec<u64>,
 }
 
 pub trait EvT: Copy {
@@ -129,6 +130,57 @@ impl ClT for PCl {
     }
 }
 
+/// Sort u64 keys by their top 31 bits (ts << 33) with an LSD radix sort (3 passes
+/// of 11/11/9 bits); ties keep no particular order. For large slices only.
+fn radix_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
+    let n = v.len();
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut h = [[0u32; 2048]; 3];
+    for &x in v.iter() {
+        h[0][((x >> 33) & 2047) as usize] += 1;
+        h[1][((x >> 44) & 2047) as usize] += 1;
+        h[2][(x >> 55) as usize] += 1;
+    }
+    let mut src_is_v = true;
+    for (d, shift) in [(0usize, 33u32), (1, 44), (2, 55)] {
+        let hd = &mut h[d];
+        if hd.iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let mut acc = 0u32;
+        for c in hd.iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+        let (src, dst): (&[u64], &mut [u64]) = if src_is_v { (&*v, &mut tmp[..]) } else { (&tmp[..], unsafe { &mut *(v as *mut [u64]) }) };
+        // SAFETY: src and dst never alias (v vs tmp)
+        let src: &[u64] = unsafe { std::slice::from_raw_parts(src.as_ptr(), n) };
+        for &x in src {
+            let k = ((x >> shift) & 2047) as usize;
+            let p = hd[k] as usize;
+            hd[k] += 1;
+            unsafe { *dst.get_unchecked_mut(p) = x };
+        }
+        src_is_v = !src_is_v;
+    }
+    if !src_is_v {
+        v.copy_from_slice(&tmp[..]);
+    }
+}
+
+#[inline]
+fn sort_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
+    if v.len() > RADIX_MIN.load(Relaxed) as usize {
+        radix_ts(v, tmp);
+    } else {
+        v.sort_unstable();
+    }
+}
+pub static RADIX_MIN: AtomicU64 = AtomicU64::new(512);
+
 /// counting sort of items by person into `out` (mapped), offsets into `off` (len np+1)
 fn group<T: Copy, U: Copy>(
     items: &[T],
@@ -177,6 +229,7 @@ pub struct Ctx {
     pub dump: bool,
     pub cat_names: Vec<Box<[u8]>>,
     pub camp_ids: Vec<Box<[u8]>>,
+    max_cat: usize,
 }
 
 impl Ctx {
@@ -216,6 +269,7 @@ impl Ctx {
             dump,
             cat_names: cat_names.to_vec(),
             camp_ids: camp_ids.to_vec(),
+            max_cat: cat_names.iter().map(|c| c.len()).max().unwrap_or(0),
         }
     }
     #[inline(always)]
@@ -280,6 +334,7 @@ impl Worker {
                 cls: vec![],
                 pevs: vec![],
                 pcls: vec![],
+                rtmp: vec![],
             },
         }
     }
@@ -308,8 +363,8 @@ impl Worker {
                 let pe = &mut evs[ea..eb];
                 let pc = &mut cls[ca..cb];
                 // SAFETY: PEv/PCl are single-u64 newtypes
-                unsafe { std::slice::from_raw_parts_mut(pe.as_mut_ptr() as *mut u64, pe.len()) }.sort_unstable();
-                unsafe { std::slice::from_raw_parts_mut(pc.as_mut_ptr() as *mut u64, pc.len()) }.sort_unstable();
+                sort_ts(unsafe { std::slice::from_raw_parts_mut(pe.as_mut_ptr() as *mut u64, pe.len()) }, &mut s.rtmp);
+                sort_ts(unsafe { std::slice::from_raw_parts_mut(pc.as_mut_ptr() as *mut u64, pc.len()) }, &mut s.rtmp);
                 if variant == 2 {
                     continue;
                 }
