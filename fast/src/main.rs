@@ -19,6 +19,9 @@ fn main() {
     let dump = std::env::var("DUMP_DIR").ok().map(PathBuf::from);
     let verbose = std::env::var("FAST_TIMING").is_ok();
     let t0 = Instant::now();
+    if std::env::var_os("FAST_NO_PREFETCH").is_none() {
+        prefetch_inputs(&data);
+    }
     let c = if std::env::var("FAST_TEMP_LOADER").is_ok() { fast::loader::load(&data) } else { fast::clean::clean(&data, nthreads) };
     let t1 = Instant::now();
     let (ud, cd) = fast::writer::prepare_dirs(&out);
@@ -68,4 +71,46 @@ fn main() {
     }
     // Skip destructors: freeing millions of small allocations at exit is pure waste.
     std::process::exit(0);
+}
+
+/// Cold page cache insurance: ask the kernel to start reading every input file now
+/// (POSIX_FADV_WILLNEED, async readahead) from a background thread, in the order the
+/// pipeline consumes them (links, clicks, events). Nearly free when the cache is warm.
+fn prefetch_inputs(data: &std::path::Path) {
+    let mut files = vec![];
+    for sub in ["links", "clicks", "events"] {
+        let mut v: Vec<_> = std::fs::read_dir(data.join(sub))
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        v.sort();
+        files.extend(v);
+    }
+    // split files into 8MB ranges, issued by several threads to keep the device queue deep
+    let nt: usize = std::env::var("FAST_PF_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let mut ranges: Vec<(std::sync::Arc<std::fs::File>, i64, i64)> = vec![];
+    for p in files {
+        if let Ok(f) = std::fs::File::open(&p) {
+            let len = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            let f = std::sync::Arc::new(f);
+            let mut o = 0;
+            while o < len {
+                let l = (8 << 20).min(len - o);
+                ranges.push((f.clone(), o, l));
+                o += l;
+            }
+        }
+    }
+    let ranges = std::sync::Arc::new(ranges);
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..nt {
+        let (ranges, next) = (ranges.clone(), next.clone());
+        std::thread::spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((f, o, l)) = ranges.get(i) else { break };
+                unsafe { libc::posix_fadvise(f.as_raw_fd(), *o, *l, libc::POSIX_FADV_WILLNEED) };
+            }
+        });
+    }
 }
