@@ -156,6 +156,28 @@ mod tests {
     }
 }
 
+/// Parallel bit extract of a 128-bit word (BMI2 pext on each half; portable fallback).
+#[inline(always)]
+fn pext128(x: u128, m: u128) -> u64 {
+    #[cfg(target_feature = "bmi2")]
+    {
+        use std::arch::x86_64::_pext_u64;
+        let (ml, mh) = (m as u64, (m >> 64) as u64);
+        unsafe { _pext_u64(x as u64, ml) | (_pext_u64((x >> 64) as u64, mh) << ml.count_ones()) }
+    }
+    #[cfg(not(target_feature = "bmi2"))]
+    {
+        let (mut r, mut k, mut mm) = (0u64, 0, m);
+        while mm != 0 {
+            let b = mm.trailing_zeros();
+            r |= (((x >> b) & 1) as u64) << k;
+            k += 1;
+            mm &= mm - 1;
+        }
+        r
+    }
+}
+
 /// Structural masks of 64 bytes at `p`: (separators ',' or '\n', newlines, quotes).
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
@@ -404,26 +426,28 @@ pub fn scan_fast<'a, const N: usize, F: FnMut([&'a [u8]; N])>(buf: &'a [u8], sta
                 ls = next;
                 continue;
             }
-            let mut fl: [&'a [u8]; N] = [&[]; N];
-            let mut s = ls;
-            let mut wsum = 0u32;
-            for k in 0..N {
-                let e = if k < N - 1 {
-                    let c = commas.trailing_zeros() as usize;
-                    commas &= commas - 1;
-                    ls + c
-                } else {
-                    ls + len
-                };
-                let n = e - s;
-                let first = unsafe { *buf.get_unchecked(s) };
-                let last = unsafe { *buf.get_unchecked(if n > 0 { e - 1 } else { s }) };
-                let w = ((n >= 2) & (first == b'"') & (last == b'"')) as usize;
-                fl[k] = unsafe { buf.get_unchecked(s + w..e - w) };
-                wsum += 2 * w as u32;
-                s = e + 1;
-            }
-            if wsum == q.count_ones() {
+            // Whole-line wrap test (len < 128 and >= N-1 >= 1 here). fs: field starts,
+            // fe: field ends (exclusive); N bits each, in field order. Field k is wrapped iff
+            // its first and last bytes are '"' and it is at least 2 long; the line is valid iff
+            // the wrapped fields account for every quote. No per-field byte loads.
+            let fs = 1u128 | (commas << 1);
+            let fe = commas | (1u128 << len);
+            let w = pext128(q & fs, fs) & pext128((q << 1) & fe, fe) & !pext128((fs << 1) & fe, fe);
+            if 2 * w.count_ones() == q.count_ones() {
+                let mut fl: [&'a [u8]; N] = [&[]; N];
+                let mut s = ls;
+                for k in 0..N {
+                    let e = if k < N - 1 {
+                        let c = commas.trailing_zeros() as usize;
+                        commas &= commas - 1;
+                        ls + c
+                    } else {
+                        ls + len
+                    };
+                    let wk = ((w >> k) & 1) as usize;
+                    fl[k] = unsafe { buf.get_unchecked(s + wk..e - wk) };
+                    s = e + 1;
+                }
                 f(fl);
             }
         }
@@ -467,6 +491,41 @@ mod scan_fast_tests {
                 let mut big = b.clone();
                 big.extend_from_slice(&[b'x'; 300]);
                 assert_eq!(collect::<7>(&big, 0, cut + 1), slow::<7>(&b[..cut + 1]));
+            }
+        }
+    }
+
+    /// Lines with exactly N fields (so the fast path's wrap logic runs), each field randomly
+    /// empty, a lone '"', '""', wrapped, or with stray quotes; lengths cross the 64-byte block edge.
+    #[test]
+    fn structured_quotes_match_split() {
+        let mut seed = 4242u64;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as usize };
+        for _ in 0..20000 {
+            let mut b = Vec::new();
+            for _ in 0..rnd() % 30 {
+                let n = [2, 4, 7][rnd() % 3] + (rnd() % 9 == 0) as usize;
+                for k in 0..n {
+                    if k > 0 { b.push(b','); }
+                    match rnd() % 7 {
+                        0 => {}
+                        1 => b.push(b'"'),
+                        2 => b.extend_from_slice(b"\"\""),
+                        3 => { b.push(b'"'); for _ in 0..rnd() % 24 { b.push(b'a' + (rnd() % 3) as u8); } b.push(b'"'); }
+                        4 => { for _ in 0..rnd() % 20 { b.push(b"ab\"x"[rnd() % 4]); } }
+                        5 => { b.push(b'"'); for _ in 0..rnd() % 30 { b.push(b'z'); } }
+                        _ => { for _ in 0..rnd() % 16 { b.push(b'a'); } }
+                    }
+                }
+                b.push(b'\n');
+            }
+            for len in [0usize, 300] {
+                let end = b.len();
+                let mut big = b.clone();
+                big.extend(std::iter::repeat(b'x').take(len));
+                assert_eq!(collect::<2>(&big, 0, end), slow::<2>(&b));
+                assert_eq!(collect::<4>(&big, 0, end), slow::<4>(&b));
+                assert_eq!(collect::<7>(&big, 0, end), slow::<7>(&b));
             }
         }
     }
