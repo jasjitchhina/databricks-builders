@@ -1,48 +1,48 @@
-//! In-memory interface between the front half (parse/clean/link, h3) and the
-//! back half (sessions/attribution/aggregation/parquet, h4). Agreed in team.db notes 1,5.
-//!
-//! All timestamps are `u32` milliseconds relative to `base_ms = window_start - 7 days`.
+//! The h3 -> h4 interface: cleaned, deduped, validated, linked rows,
+//! partitioned by person.
 
-pub const DAY_MS: i64 = 86_400_000;
-pub const WEEK_MS: u32 = 604_800_000;
-pub const GAP_MS: u32 = 1_800_000;
-pub const NPART: usize = 256;
+pub use crate::ids::NPART;
 
 pub struct Cleaned {
+    /// window_start - 7 days; every `ts` below is `ts_ms - base_ms` (21 days fits u32).
     pub base_ms: i64,
     pub ws_ms: i64,
     pub we_ms: i64,
-    /// category idx -> name, including "unknown"
+    /// category index -> name; includes `unknown` (index `unknown_cat`).
     pub cat_names: Vec<Box<[u8]>>,
-    /// campaigns.csv order; `organic` NOT included
+    pub unknown_cat: u16,
+    /// campaigns.csv order; `organic` is NOT included.
     pub camp_ids: Vec<Box<[u8]>>,
     pub camp_channels: Vec<Box<[u8]>>,
-    /// person-hash partitioned: a person lives in exactly one part
+    /// NPART parts; every person lives in exactly one part.
     pub parts: Vec<Part>,
 }
 
 #[derive(Default)]
 pub struct Part {
-    /// part-local person idx -> name (byte-wise smallest ID)
+    /// part-local person index -> person name (byte-wise smallest linked ID).
     pub person_names: Vec<Box<[u8]>>,
-    /// surviving events (deduped, validated, late dropped), unsorted
+    /// surviving events (after dedup, validation, late drop), unsorted.
     pub ev: Vec<Ev>,
-    /// valid clicks, unsorted, NOT necessarily deduped (copies are identical)
+    /// valid clicks (not deduped: copies are identical), unsorted. Only clicks
+    /// of persons that have at least one surviving event are included.
     pub cl: Vec<Cl>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ev {
     pub person: u32,
     pub ts: u32,
-    /// price_cents for purchases (>=1), 0 for view/cart
+    /// price in cents for a purchase (always >= 1); 0 for view/cart.
     pub price: u32,
+    /// category index; only meaningful for purchases (0 otherwise).
     pub cat: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cl {
-    /// order-preserving packed click_id: plain u128 compare == byte-wise compare
+    /// order-preserving key of click_id: plain u128 comparison == byte-wise
+    /// comparison of the click IDs; equal iff same click_id.
     pub click_id: u128,
     pub person: u32,
     pub ts: u32,

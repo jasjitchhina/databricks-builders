@@ -1,6 +1,8 @@
 //! TEMPORARY simple (single-threaded) loader implementing the parse/clean/link
 //! rules, producing `Cleaned`. To be replaced by h3's parallel parser.
 use crate::model::*;
+use crate::DAY_MS;
+use crate::model::NPART;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 
@@ -184,6 +186,7 @@ struct Flat {
     ev_price: Vec<u32>,
     ev_cat: Vec<u16>,
     cat_names: Vec<Box<[u8]>>,
+    unknown: u16,
     cl_person: Vec<u32>,
     cl_ts: Vec<u32>,
     cl_camp: Vec<u16>,
@@ -216,6 +219,7 @@ pub fn load(data: &Path) -> Cleaned {
         ws_ms: c.ws_ms,
         we_ms: c.we_ms,
         cat_names: c.cat_names,
+        unknown_cat: c.unknown,
         camp_ids: c.camp_ids,
         camp_channels: c.camp_channels,
         parts,
@@ -249,6 +253,7 @@ fn load_flat(data: &Path) -> Flat {
         cats[v as usize] = k.into_boxed_slice();
     }
     c.cat_names = cats;
+    c.unknown = unknown;
 
     // campaigns
     let mut camp: FxHashMap<Vec<u8>, u16> = FxHashMap::default();

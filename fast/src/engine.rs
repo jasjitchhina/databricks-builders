@@ -1,6 +1,7 @@
 //! Back half: group by person, sessionize, attribute clicks, 7-day assists,
 //! aggregate into user_daily / campaign_daily rows.
 use crate::model::*;
+use crate::{DAY_MS, GAP_MS, WEEK_MS};
 use rayon::prelude::*;
 
 pub struct UserRow {
