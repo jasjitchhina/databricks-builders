@@ -12,8 +12,6 @@ libc = "0.2"
 
 [features]
 huge = []
-
-[features]
 tools = ["dep:parquet"]
 
 [[bin]]
