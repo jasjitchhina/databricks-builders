@@ -21,6 +21,14 @@ pub struct CampAcc {
     pub assisted: u64,
 }
 
+/// Per-worker credited-session accumulator (sessions/purchasing fit u32 per worker).
+#[derive(Clone, Copy, Default)]
+struct CampAcc16 {
+    sessions: u32,
+    purchasing: u32,
+    revenue: u64,
+}
+
 pub struct Output {
     pub day0: i32,
     pub ndays: usize,
@@ -40,8 +48,8 @@ struct Scratch {
     cat_touched: Vec<u16>,
     sess_cat: Vec<u64>,
     sess_touched: Vec<u16>,
-    /// day-major [di * (ncamp+1) + k]
-    camp: Vec<CampAcc>,
+    /// day-major [di * (ncamp+1) + k], compact (16B) so the hot table stays in L2
+    camp: Vec<CampAcc16>,
     /// day-major [di * (ncamp+1) + k], compact so one session's assists hit one 8KB row
     asst: Vec<u32>,
     ncamp1: usize,
@@ -319,7 +327,7 @@ impl Worker {
                 cat_touched: vec![],
                 sess_cat: vec![0; ncat],
                 sess_touched: vec![],
-                camp: vec![CampAcc::default(); (ncamp + 1) * ndays],
+                camp: vec![CampAcc16::default(); (ncamp + 1) * ndays],
                 asst: vec![0; (ncamp + 1) * ndays],
                 ncamp1: ncamp + 1,
                 ucols: pq::user_cols(),
@@ -408,9 +416,13 @@ impl Worker {
         let mut cm = vec![CampAcc::default(); (ncamp + 1) * ndays];
         for di in 0..ndays {
             for k in 0..=ncamp {
-                let mut a = sc.camp[di * (ncamp + 1) + k];
-                a.assisted = sc.asst[di * (ncamp + 1) + k] as u64;
-                cm[k * ndays + di] = a;
+                let a = sc.camp[di * (ncamp + 1) + k];
+                cm[k * ndays + di] = CampAcc {
+                    sessions: a.sessions as u64,
+                    purchasing: a.purchasing as u64,
+                    revenue: a.revenue,
+                    assisted: sc.asst[di * (ncamp + 1) + k] as u64,
+                };
             }
         }
         WorkerOut { urows: sc.urows, camp: cm, dump: std::mem::take(&mut sc.dump) }
@@ -608,7 +620,7 @@ fn process_person<E: EvT, C: ClT>(
 
         let ca = unsafe { camp.get_unchecked_mut(row + credited as usize) };
         ca.sessions += 1;
-        ca.purchasing += (rev > 0) as u64; // every purchase has price >= 1
+        ca.purchasing += (rev > 0) as u32; // every purchase has price >= 1
         ca.revenue += rev;
 
         if dump {
