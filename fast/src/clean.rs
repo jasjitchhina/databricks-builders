@@ -5,7 +5,7 @@ use crate::csv::{self, pack_in, Chunk};
 use crate::ids::{key_cmp, pack, Key, KeyMap, NPART};
 use crate::keys::{part_of, GMap, GSharded, IdKey};
 use crate::model::{Cl, Cleaned, Ev, Part};
-use crate::ts::{parse_ts, DAY_MS};
+use crate::ts::{parse_ts, parse_ts_in, DAY_MS};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::path::Path;
@@ -429,7 +429,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                     if cid.is_empty() || user.is_empty() {
                         return;
                     }
-                    let Some(t) = parse_ts(ts) else { return };
+                    let Some(t) = parse_ts_in(m, ts) else { return };
                     if t < cl_lo || t >= we {
                         return;
                     }
@@ -670,14 +670,14 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
     if eid.is_empty() {
         return Ok(None);
     }
-    let ingest = parse_ts(ing).unwrap_or(i64::MAX);
+    let ingest = parse_ts_in(m, ing).unwrap_or(i64::MAX);
     let Some(ek) = K::pack(m, eid) else { return Err(()) };
     let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0 };
     'v: {
         if user.is_empty() || prod.is_empty() {
             break 'v;
         }
-        let Some(t) = parse_ts(ts) else { break 'v };
+        let Some(t) = parse_ts_in(m, ts) else { break 'v };
         if t < ws || t >= we {
             break 'v;
         }

@@ -130,6 +130,50 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     parse_f3(b)
 }
 
+/// `parse_ts` for a field inside mapping `m`: the F3 form uses a SIMD digit
+/// parser that reads the 16 bytes ending at the field's end when they lie in `m`.
+#[inline(always)]
+pub fn parse_ts_in(m: &[u8], b: &[u8]) -> Option<i64> {
+    match b.len() {
+        20 if b[19] == b'Z' => return civil19(b),
+        25 if (b[19] == b'+' || b[19] == b'-') && b[22] == b':' => return parse_ts(b),
+        _ => {}
+    }
+    #[cfg(target_feature = "avx2")]
+    {
+        let n = b.len();
+        let end = b.as_ptr() as usize + n;
+        if n >= 1 && n <= 16 && end - 16 >= m.as_ptr() as usize && end <= m.as_ptr() as usize + m.len() {
+            return unsafe { f3_simd(b.as_ptr().add(n), n) };
+        }
+    }
+    let _ = m;
+    parse_f3(b)
+}
+
+/// Digits-only value of the n (1..=16) bytes ending at `end` (the 16 bytes
+/// before `end` must be readable).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn f3_simd(end: *const u8, n: usize) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let x = _mm_loadu_si128(end.sub(16) as *const __m128i);
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let pre = _mm_cmpgt_epi8(_mm_set1_epi8((16 - n) as i8), idx);
+    let x = _mm_blendv_epi8(x, _mm_set1_epi8(b'0' as i8), pre);
+    let d = _mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+        return None;
+    }
+    let p = _mm_maddubs_epi16(d, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let q = _mm_madd_epi16(p, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let r = _mm_packus_epi32(q, q);
+    let t = _mm_madd_epi16(r, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(t) as u32 as u64;
+    let lo = _mm_extract_epi32(t, 1) as u32 as u64;
+    Some((hi * 100_000_000 + lo) as i64)
+}
+
 #[inline]
 fn parse_f3(b: &[u8]) -> Option<i64> {
     if b.is_empty() {
@@ -240,15 +284,19 @@ mod fuzz {
     fn differential() {
         let mut seed = 99u64;
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
-        let templates: [&[u8]; 4] = [b"2028-02-29T23:59:59Z", b"2027-12-31T00:00:00+05:30", b"1999-09-09T09:09:09-00:00", b"0001791071890000"];
+        let templates: [&[u8]; 8] = [b"2028-02-29T23:59:59Z", b"2027-12-31T00:00:00+05:30", b"1999-09-09T09:09:09-00:00", b"0001791071890000", b"1791071890000", b"9999999999999999", b"7", b"00000000000000000001791071890000"];
         let alpha = b"0123456789-+:TZtz /\x7f\xff";
         for _ in 0..2_000_000 {
-            let mut v = templates[rnd() as usize % 4].to_vec();
+            let mut v = templates[rnd() as usize % 8].to_vec();
             for _ in 0..(rnd() % 3) {
                 let i = rnd() as usize % v.len();
                 v[i] = if rnd() % 2 == 0 { alpha[rnd() as usize % alpha.len()] } else { b'0' + (rnd() % 10) as u8 };
             }
             assert_eq!(parse_ts(&v), ref_ts(&v), "{:?}", String::from_utf8_lossy(&v));
+            let mut padded = vec![b'7'; 20];
+            padded.extend_from_slice(&v);
+            padded.extend_from_slice(b",x");
+            assert_eq!(parse_ts_in(&padded, &padded[20..20 + v.len()]), ref_ts(&v), "in {:?}", String::from_utf8_lossy(&v));
         }
     }
 }

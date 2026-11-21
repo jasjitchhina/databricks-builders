@@ -82,26 +82,80 @@ const fn decode_table() -> [u8; 64] {
 static CODE: [u8; 256] = code_table();
 static DECODE: [u8; 64] = decode_table();
 
+/// SIMD compact encode of a field of length n <= 10 whose 16 bytes from
+/// `p` are readable. Same result as the scalar `pack_scalar`.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn pack_simd(p: *const u8, n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let b = _mm_loadu_si128(p as *const __m128i);
+    let ge = |x: __m128i, lo: u8| _mm_cmpeq_epi8(_mm_max_epu8(x, _mm_set1_epi8(lo as i8)), x); // x >= lo
+    let le = |x: __m128i, hi: u8| _mm_cmpeq_epi8(_mm_min_epu8(x, _mm_set1_epi8(hi as i8)), x); // x <= hi
+    let dig = _mm_and_si128(ge(b, b'0'), le(b, b'9'));
+    let up = _mm_and_si128(ge(b, b'A'), le(b, b'Z'));
+    let lo = _mm_and_si128(ge(b, b'a'), le(b, b'z'));
+    let us = _mm_cmpeq_epi8(b, _mm_set1_epi8(b'_' as i8));
+    // code = b - off, off = 47 (digit), 54 (upper), 59 (lower); '_' -> 37
+    let off = _mm_or_si128(
+        _mm_or_si128(_mm_and_si128(dig, _mm_set1_epi8(47)), _mm_and_si128(up, _mm_set1_epi8(54))),
+        _mm_and_si128(lo, _mm_set1_epi8(59)),
+    );
+    let code = _mm_or_si128(_mm_and_si128(_mm_sub_epi8(b, off), _mm_or_si128(_mm_or_si128(dig, up), lo)), _mm_and_si128(us, _mm_set1_epi8(37)));
+    let valid = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(dig, up), _mm_or_si128(lo, us))) as u32;
+    let need = (1u32 << n) - 1;
+    if valid & need != need {
+        return None;
+    }
+    // zero lanes >= n
+    let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let keep = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), idx);
+    let code = _mm_and_si128(code, keep);
+    // pairs: c0*64 + c1 (u16), then quads: (c0c1)*4096 + c2c3 (u32, 24 bits)
+    let pairs = _mm_maddubs_epi16(code, _mm_setr_epi8(64, 1, 64, 1, 64, 1, 64, 1, 64, 1, 64, 1, 64, 1, 64, 1));
+    let quads = _mm_madd_epi16(pairs, _mm_setr_epi16(4096, 1, 4096, 1, 4096, 1, 4096, 1));
+    let l0 = _mm_cvtsi128_si32(quads) as u32 as u64;
+    let l1 = _mm_extract_epi32(quads, 1) as u32 as u64;
+    let l2 = _mm_extract_epi32(quads, 2) as u32 as u64;
+    Some((l0 << 40) | (l1 << 16) | (l2 >> 8))
+}
+
+#[inline(always)]
+fn pack_scalar(f: &[u8]) -> Option<u64> {
+    let n = f.len();
+    if n > 10 {
+        return None;
+    }
+    let mut k: u64 = 0;
+    let mut ok: u8 = 1;
+    for (i, &c) in f.iter().enumerate() {
+        let code = CODE[c as usize];
+        ok &= (code != 0) as u8;
+        k |= (code as u64) << (58 - 6 * i);
+    }
+    if ok == 0 {
+        None
+    } else {
+        Some(k)
+    }
+}
+
 impl IdKey for u64 {
     const WIDE: bool = false;
     #[inline(always)]
-    fn pack(_m: &[u8], f: &[u8]) -> Option<Self> {
+    fn pack(m: &[u8], f: &[u8]) -> Option<Self> {
         let n = f.len();
         if n > 10 {
             return None;
         }
-        let mut k: u64 = 0;
-        let mut ok: u8 = 1;
-        for (i, &c) in f.iter().enumerate() {
-            let code = CODE[c as usize];
-            ok &= (code != 0) as u8;
-            k |= (code as u64) << (58 - 6 * i);
+        #[cfg(target_feature = "avx2")]
+        {
+            let off = f.as_ptr() as usize - m.as_ptr() as usize;
+            if off + 16 <= m.len() {
+                return unsafe { pack_simd(f.as_ptr(), n) };
+            }
         }
-        if ok == 0 {
-            None
-        } else {
-            Some(k)
-        }
+        let _ = m;
+        pack_scalar(f)
     }
     #[inline(always)]
     fn hash(self) -> u64 {
@@ -335,6 +389,19 @@ mod tests {
                 let ky = <u64 as IdKey>::pack(y, y).unwrap();
                 assert_eq!(kx.cmp(&ky), x.cmp(y), "{:?} {:?}", x, y);
             }
+        }
+        // SIMD path (field inside a padded buffer) == scalar path, valid or not
+        let alpha2 = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz /:@[`{\x7f\xff\x00-";
+        for _ in 0..200000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = (seed >> 59) as usize % 12;
+            let mut buf = vec![b'q'; 40];
+            for j in 0..n {
+                let r = (seed >> (j * 5 % 50)) as usize;
+                buf[3 + j] = if (seed >> 60) & 3 == 0 { alpha2[r % alpha2.len()] } else { alpha[r % alpha.len()] };
+            }
+            let f = &buf[3..3 + n];
+            assert_eq!(<u64 as IdKey>::pack(&buf, f), pack_scalar(f), "{:?}", f);
         }
         for bad in [&b"u1 "[..], b" u1", b"u-1", b"u1\r", b"\xc3\xbc", b"01234567890", b"a\"b", b"\0"] {
             assert_eq!(<u64 as IdKey>::pack(bad, bad), None, "{:?}", bad);
