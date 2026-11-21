@@ -90,8 +90,9 @@ for DS in "${DATASETS[@]}"; do
     docker start "$CID" >/dev/null
     CG="/sys/fs/cgroup/system.slice/docker-$CID.scope"
     PEAK=0
-    while [ "$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)" = "true" ]; do
-      if [ -r "$CG/memory.peak" ]; then v=$(cat "$CG/memory.peak" 2>/dev/null || echo 0); [ "$v" -gt "$PEAK" ] 2>/dev/null && PEAK=$v; fi
+    # poll the container's cgroup (cheap; no docker CLI calls) until it disappears at exit
+    while [ -d "$CG" ]; do
+      v=$(cat "$CG/memory.peak" 2>/dev/null || echo 0); [ "$v" -gt "$PEAK" ] 2>/dev/null && PEAK=$v
       sleep 0.02
     done
     docker wait "$CID" >/dev/null
