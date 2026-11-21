@@ -571,66 +571,87 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
     let deduped = par_items(
         threads,
         NB,
-        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<u32>::new(), WcRegions::<PRec<K>, 8>::new_with(NPART, out_cap, huge)),
-        |(table, surv, losers, out), b| {
+        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u16)>::new(), Vec::<(u32, u64)>::new(), WcRegions::<PRec<K>, 8>::new_with(NPART, out_cap, huge), Vec::<u8>::new()),
+        |(table, surv, cand, out, cnt), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
             if n == 0 {
                 return;
             }
             let _q0 = Instant::now();
-            let cap = (n + n / 2).next_power_of_two().max(64);
-            table.clear();
-            table.resize(cap, 0);
-            let mask = cap - 1;
-            let get = |r: u32| -> &ERec<K> { unsafe { states.get_unchecked((r >> 26) as usize) }.ev.at(b, (r & ((1 << 26) - 1)) as usize) };
-            losers.clear();
+            // Pass 1: count event_id hashes into byte counters (~16 per record,
+            // L2-resident). A record whose counter is 1 has a unique event_id
+            // in this bucket (copies share the hash), so it skips the table.
+            let cm = (n * 16).next_power_of_two().max(64);
+            let cmask = cm - 1;
+            cnt.clear();
+            cnt.resize(cm, 0u8);
+            for s in states.iter() {
+                s.ev.each(b, |_, r| {
+                    let c = unsafe { cnt.get_unchecked_mut((r.eid.hash() >> NB_BITS) as usize & cmask) };
+                    *c += (*c < 2) as u8;
+                });
+            }
+            // Pass 2: unique -> survivor (if valid); otherwise a dedup candidate.
+            surv.clear();
+            cand.clear();
             for (ti, s) in states.iter().enumerate() {
                 s.ev.each(b, |ri, r| {
                     let h = r.eid.hash();
-                    let tag = h >> 32;
-                    let mut i = (h >> NB_BITS) as usize & mask;
-                    let me = ((ti as u32) << 26) | ri as u32;
-                    loop {
-                        let slot = unsafe { table.get_unchecked_mut(i) };
-                        if *slot == 0 {
-                            *slot = (tag << 32) | (me as u64 + 1);
-                            break;
+                    if unsafe { *cnt.get_unchecked((h >> NB_BITS) as usize & cmask) } == 1 {
+                        if r.ts != NOT_OK {
+                            let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
+                            surv.push((r.user, r.user.hash(), r.ts, price, cat));
                         }
-                        if (*slot >> 32) == tag {
-                            let o = (*slot as u32).wrapping_sub(1);
-                            let old = get(o);
-                            if old.eid == r.eid {
-                                if r.ingest < old.ingest {
-                                    *slot = (tag << 32) | (me as u64 + 1);
-                                    losers.push(o);
-                                } else {
-                                    losers.push(me);
-                                }
-                                break;
-                            }
-                        }
-                        i = (i + 1) & mask;
+                    } else {
+                        cand.push((((ti as u32) << 26) | ri as u32, h));
                     }
                 });
             }
             let _q1 = Instant::now();
-            losers.sort_unstable();
-            surv.clear();
-            let mut li = 0;
-            for (ti, s) in states.iter().enumerate() {
-                s.ev.each(b, |ri, r| {
-                    let me = ((ti as u32) << 26) | ri as u32;
-                    if li < losers.len() && losers[li] == me {
-                        li += 1;
-                        return;
+            // Pass 3: exact dedup among candidates (true copies + counter
+            // collisions): keep the smallest ingest_ts; equal ingest_ts copies
+            // are identical, the first one stays.
+            let get = |r: u32| -> &ERec<K> { unsafe { states.get_unchecked((r >> 26) as usize) }.ev.at(b, (r & ((1 << 26) - 1)) as usize) };
+            let tcap = (cand.len() * 2).next_power_of_two().max(16);
+            let mask = tcap - 1;
+            table.clear();
+            table.resize(tcap, 0);
+            for &(me, h) in cand.iter() {
+                let tag = h >> 32;
+                let mut i = (h >> NB_BITS) as usize & mask;
+                let r = get(me);
+                loop {
+                    let slot = unsafe { table.get_unchecked_mut(i) };
+                    if *slot == 0 {
+                        *slot = (tag << 32) | (me as u64 + 1);
+                        break;
                     }
-                    if r.ts == NOT_OK {
-                        return;
+                    if (*slot >> 32) == tag {
+                        let o = (*slot as u32).wrapping_sub(1);
+                        let old = get(o);
+                        if old.eid == r.eid {
+                            if r.ingest < old.ingest {
+                                *slot = (tag << 32) | (me as u64 + 1);
+                            }
+                            break;
+                        }
                     }
-                    let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
-                    surv.push((r.user, r.user.hash(), r.ts, price, cat));
-                });
+                    i = (i + 1) & mask;
+                }
+            }
+            for &e in table.iter() {
+                if e == 0 {
+                    continue;
+                }
+                let o = (e as u32).wrapping_sub(1);
+                let r = get(o);
+                if r.ts == NOT_OK {
+                    continue;
+                }
+                let s = unsafe { states.get_unchecked((o >> 26) as usize) };
+                let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
+                surv.push((r.user, r.user.hash(), r.ts, price, cat));
             }
             let _q2 = Instant::now();
             let n = surv.len();
@@ -669,7 +690,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
             let (b, l) = states[t.min(states.len() - 1)].ev.raw();
             unsafe { crate::alloc::Bump::new(b, if t < states.len() && recycle { l } else { 0 }) }
         }, |bump, p| {
-            let n: usize = deduped.iter().map(|(_, _, _, o)| o.len_of(p)).sum();
+            let n: usize = deduped.iter().map(|(_, _, _, o, _)| o.len_of(p)).sum();
             let mut local: GMap<K, u32> = GMap::with_capacity(1024);
             let mut names: Vec<K> = Vec::new();
             let mut ev_vec: Vec<Ev> = Vec::new();
@@ -681,7 +702,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small: &Small) -> Option<Cle
                 }
             };
             let mut ne = 0usize;
-            for (_, _, _, o) in deduped.iter() {
+            for (_, _, _, o, _) in deduped.iter() {
                 o.each(p, |_, r| {
                     let id = match local.get_or_insert(r.person, names.len() as u32) {
                         Some(v) => v,
