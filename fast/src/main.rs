@@ -69,13 +69,20 @@ fn main() {
         let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         eprintln!("end_epoch_ns {ns}");
     }
-    // Skip destructors: freeing millions of small allocations at exit is pure waste.
+    // Outputs are written and closed. Skip destructors (freeing millions of small
+    // allocations is pure waste) and pre-clear page tables in parallel so the
+    // single-threaded exit teardown has little left to do.
+    if std::env::var_os("FAST_NO_ZAP").is_none() {
+        zap_and_exit(&data, nthreads, std::env::var_os("FAST_NO_ZAP_ANON").is_none(), verbose);
+    }
     std::process::exit(0);
 }
 
 /// Cold page cache insurance: ask the kernel to start reading every input file now
 /// (POSIX_FADV_WILLNEED, async readahead) from a background thread, in the order the
 /// pipeline consumes them (links, clicks, events). Nearly free when the cache is warm.
+static PREFETCH: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(Vec::new());
+
 fn prefetch_inputs(data: &std::path::Path) {
     let mut files = vec![];
     for sub in ["links", "clicks", "events"] {
@@ -90,9 +97,10 @@ fn prefetch_inputs(data: &std::path::Path) {
     let nt: usize = std::env::var("FAST_PF_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let files = std::sync::Arc::new(files);
     let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut hs = PREFETCH.lock().unwrap();
     for _ in 0..nt {
         let (files, next) = (files.clone(), next.clone());
-        std::thread::spawn(move || {
+        hs.push(std::thread::spawn(move || {
             use std::os::unix::io::AsRawFd;
             loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -106,6 +114,116 @@ fn prefetch_inputs(data: &std::path::Path) {
                     o += l;
                 }
             }
+        }));
+    }
+}
+
+const MAX_RANGES: usize = 1 << 14;
+/// Work list for the zap threads. Lives in .bss (a small mapping that is never
+/// zapped) because heap memory may be zeroed under their feet.
+static mut ZAP: [(usize, usize); MAX_RANGES] = [(0, 0); MAX_RANGES];
+static ZAP_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ZAP_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ZAP_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ZAP_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ZAP_READY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// stack and TLS addresses of every thread alive during the zap (never zapped)
+static ZAP_KEEP: [std::sync::atomic::AtomicUsize; 64] = [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
+thread_local! {
+    static TLS_PROBE: u8 = const { 0 };
+}
+fn tls_addr() -> usize {
+    TLS_PROBE.with(|x| x as *const u8 as usize)
+}
+
+/// Called once, after every output file is written and closed; never returns.
+/// MADV_DONTNEED (runs under the mmap read lock, so it scales across threads,
+/// unlike munmap) on (1) the read-only CSV file mappings under DATA_DIR and
+/// (2) if `anon`, every large private anonymous mapping (THP=never hedge: exit
+/// would otherwise free GBs of 4K pages on one thread). After the zap no code may
+/// touch the heap: zap threads only make syscalls, then sleep; main spins on
+/// atomics and calls _exit.
+fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bool) -> ! {
+    use std::sync::atomic::Ordering::SeqCst;
+    // no other thread may run (and allocate) during the zap
+    for h in PREFETCH.lock().unwrap().drain(..) {
+        let _ = h.join();
+    }
+    let root = std::fs::canonicalize(data).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let nt = nthreads.clamp(1, 16);
+    // spawn the zap threads first (spawning allocates); each publishes its stack and
+    // TLS addresses, then waits for ZAP_GO
+    for t in 0..nt {
+        std::thread::spawn(move || {
+            let probe = 0u8;
+            ZAP_KEEP[2 * t].store(std::hint::black_box(&probe) as *const u8 as usize, SeqCst);
+            ZAP_KEEP[2 * t + 1].store(tls_addr(), SeqCst);
+            ZAP_READY.fetch_add(1, SeqCst);
+            while !ZAP_GO.load(SeqCst) {
+                std::hint::spin_loop();
+            }
+            loop {
+                let i = ZAP_NEXT.fetch_add(1, SeqCst);
+                if i >= ZAP_N.load(SeqCst) {
+                    break;
+                }
+                let (a, l) = unsafe { (*std::ptr::addr_of!(ZAP))[i] };
+                unsafe { libc::madvise(a as *mut libc::c_void, l, libc::MADV_DONTNEED) };
+            }
+            ZAP_DONE.fetch_add(1, SeqCst);
+            loop {
+                unsafe { libc::pause() };
+            }
         });
     }
+    while ZAP_READY.load(SeqCst) < nt {
+        std::hint::spin_loop();
+    }
+    let probe = 0u8;
+    let mut keep: Vec<usize> = ZAP_KEEP[..2 * nt].iter().map(|a| a.load(SeqCst)).collect();
+    keep.push(std::hint::black_box(&probe) as *const u8 as usize); // main stack
+    keep.push(tls_addr()); // main TLS
+    keep.push(std::ptr::addr_of!(ZAP) as usize);
+    keep.push(&ZAP_DONE as *const _ as usize);
+    keep.push(&ZAP_KEEP as *const _ as usize);
+    let (mut n, mut file_mb, mut anon_mb) = (0usize, 0usize, 0usize);
+    for line in maps.lines() {
+        // addr perms offset dev inode [path]
+        let mut it = line.split_whitespace();
+        let (Some(addr), Some(perms)) = (it.next(), it.next()) else { continue };
+        let path = it.nth(3).unwrap_or("");
+        let Some((a, b)) = addr.split_once('-') else { continue };
+        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+        let is_file = perms.starts_with("r--") && !root.is_empty() && path.starts_with(root.as_str());
+        let is_anon = anon
+            && perms == "rw-p"
+            && path.is_empty()
+            && b - a >= (8 << 20)
+            && !keep.iter().any(|k| (a..b).contains(k));
+        if !is_file && !is_anon {
+            continue;
+        }
+        if is_file { file_mb += (b - a) >> 20 } else { anon_mb += (b - a) >> 20 }
+        // 32MB pieces for balance
+        let mut x = a;
+        while x < b && n < MAX_RANGES {
+            let l = (32usize << 20).min(b - x);
+            unsafe { (*std::ptr::addr_of_mut!(ZAP))[n] = (x, l) };
+            n += 1;
+            x += l;
+        }
+    }
+    if verbose {
+        eprintln!("zap: {n} ranges, file {file_mb} MB, anon {anon_mb} MB");
+    }
+    drop(maps);
+    drop(keep);
+    ZAP_N.store(n, SeqCst);
+    ZAP_GO.store(true, SeqCst);
+    // from here on: no allocation, no destructors, no stdio
+    while ZAP_DONE.load(SeqCst) < nt {
+        std::hint::spin_loop();
+    }
+    unsafe { libc::_exit(0) }
 }

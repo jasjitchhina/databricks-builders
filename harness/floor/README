@@ -2,3 +2,4 @@ Container overhead floor probes (task 21). gcc -O2 -static [-pthread]; images bu
 true.c: no-op. alloc.c: touch GB of anon memory (THP=1 madvise hugepage) then _exit, prints MARK realtime.
 touchall.c: mmap+touch every /data CSV page (UNMAP=1 munmap each) then _exit, prints MARK.
 incont.sh "ENV": scorer-flag run on cpuset 0-7 (take flock -x /tmp/bench.lock first), prints start->MARK, MARK->exit.
+nothp.c: PR_SET_THP_DISABLE then execv (inherited) = simulate THP=never; Dockerfile.nothp wraps a bench-rev image. parfree.c: PARFREE=1 parallel munmap, =2 parallel MADV_DONTNEED before exit.
