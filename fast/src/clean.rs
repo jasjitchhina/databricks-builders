@@ -823,20 +823,28 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 }
 
 /// Ok(None): malformed for dedup purposes (empty event_id). Err: an ID is not representable as K.
+/// A/B switch for the h1 prototype only: FAST_NO_FUSED_TS=1 = old separate parses.
+#[inline(always)]
+fn fused_ts() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("FAST_NO_FUSED_TS").is_none())
+}
+
 #[inline(always)]
 fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, lk: &Lookups, side: &mut Vec<(u32, u16)>) -> Result<Option<ERec<K>>, ()> {
     let [eid, user, ts, ing, typ, prod, price] = f;
     if eid.is_empty() {
         return Ok(None);
     }
-    let ingest = parse_ts_in(m, ing).unwrap_or(i64::MAX);
+    let (tsv, ingv) = if fused_ts() { crate::ts::parse_ts_pair(m, ts, ing) } else { (None, parse_ts_in(m, ing)) };
+    let ingest = ingv.unwrap_or(i64::MAX);
     let Some(ek) = K::pack(m, eid) else { return Err(()) };
     let mut rec = ERec { eid: ek, user: K::default(), ingest, ts: NOT_OK, pc: 0 };
     'v: {
         if user.is_empty() || prod.is_empty() {
             break 'v;
         }
-        let Some(t) = parse_ts_in(m, ts) else { break 'v };
+        let Some(t) = (if fused_ts() { tsv } else { parse_ts_in(m, ts) }) else { break 'v };
         if t < ws || t >= we {
             break 'v;
         }
@@ -918,6 +926,11 @@ pub fn microbench(dir: &Path) {
     run("scan+ts_in", &mut || {
         let mut x = 0u64;
         csv::scan_fast::<7, _>(m, 0, n, |f| x = x.wrapping_add(parse_ts_in(m, f[2]).unwrap_or(0) as u64 ^ parse_ts_in(m, f[3]).unwrap_or(0) as u64));
+        x
+    });
+    run("scan+pair", &mut || {
+        let mut x = 0u64;
+        csv::scan_fast::<7, _>(m, 0, n, |f| { let (a, b) = crate::ts::parse_ts_pair(m, f[2], f[3]); x = x.wrapping_add(a.unwrap_or(0) as u64 ^ b.unwrap_or(0) as u64) });
         x
     });
     run("scan+ing", &mut || {

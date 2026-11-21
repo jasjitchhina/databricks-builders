@@ -373,3 +373,157 @@ mod fuzz {
         }
     }
 }
+
+/// `(parse_ts_in(m, ts), parse_ts_in(m, ing))`, fused for the common case of an event
+/// line whose `ts` and `ingest_ts` are both F1 (`YYYY-MM-DDTHH:MM:SSZ`): one 256-bit
+/// pipeline (low lane = ts, high lane = ingest) does both separator checks, digit checks,
+/// digit-pair folding and field range checks; only the calendar-table lookup is scalar.
+/// Any other shape falls back to `parse_ts_in` for each field, so the result is always
+/// identical to the two separate calls (unit-tested below against the scalar path).
+#[inline(always)]
+pub fn parse_ts_pair(m: &[u8], ts: &[u8], ing: &[u8]) -> (Option<i64>, Option<i64>) {
+    #[cfg(target_feature = "avx2")]
+    {
+        if ts.len() == 20 && ing.len() == 20 && ts[19] == b'Z' && ing[19] == b'Z' {
+            return unsafe { civil19x2_simd(ts.as_ptr(), ing.as_ptr()) };
+        }
+    }
+    (parse_ts_in(m, ts), parse_ts_in(m, ing))
+}
+
+/// Two `civil19_simd` in one AVX2 pass. Reads bytes 0..20 of a and of b.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn civil19x2_simd(a: *const u8, b: *const u8) -> (Option<i64>, Option<i64>) {
+    use std::arch::x86_64::*;
+    let lo = _mm256_loadu2_m128i(b as *const __m128i, a as *const __m128i); // [a 0..16 | b 0..16]
+    let hi = _mm256_loadu2_m128i(b.add(4) as *const __m128i, a.add(4) as *const __m128i); // [a 4..20 | b 4..20]
+    // separators '-' 4, '-' 7, 'T' 10, ':' 13 (from lo) and ':' 16 (hi offset 12), per lane
+    let sep = _mm256_or_si256(
+        _mm256_shuffle_epi8(lo, _mm256_setr_epi8(4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)),
+        _mm256_shuffle_epi8(hi, _mm256_setr_epi8(-1, -1, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)),
+    );
+    let (dsh, cl, ccol) = (b'-' as i8, b'T' as i8, b':' as i8);
+    let want = _mm256_setr_epi8(dsh, dsh, cl, ccol, ccol, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, dsh, dsh, cl, ccol, ccol, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    let sep_ok = _mm256_movemask_epi8(_mm256_cmpeq_epi8(sep, want)) as u32;
+    // digits Y0..Y3 M0 M1 D0 D1 H0 H1 (lo 0,1,2,3,5,6,8,9,11,12), m0 m1 S0 S1 (hi 10,11,13,14)
+    let dig = _mm256_or_si256(
+        _mm256_shuffle_epi8(lo, _mm256_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, -1, -1, -1, -1, -1, -1)),
+        _mm256_shuffle_epi8(hi, _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 10, 11, 13, 14, -1, -1)),
+    );
+    let z = b'0' as i8;
+    let dig = _mm256_or_si256(dig, _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, z, z, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, z, z));
+    let d = _mm256_sub_epi8(dig, _mm256_set1_epi8(b'0' as i8));
+    let dig_ok = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d)) as u32;
+    // u16 per lane: [Y0Y1, Y2Y3, MM, DD, hh, mm, ss, 0]
+    let v = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x010A));
+    // range checks per u16 lane: MM in 1..=12, DD >= 1 (<= month length checked below), hh<=23, mm<=59, ss<=59
+    let max = _mm256_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0, 99, 99, 12, 31, 23, 59, 59, 0);
+    let min = _mm256_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0);
+    let bad = _mm256_or_si256(_mm256_cmpgt_epi16(v, max), _mm256_cmpgt_epi16(min, v));
+    let rng_ok = !(_mm256_movemask_epi8(bad) as u32);
+    // y = Y0Y1*100 + Y2Y3 and hms = hh*3600 + mm*60 + ss, via madd on u16 pairs
+    let ym = _mm256_madd_epi16(v, _mm256_setr_epi16(100, 1, 0, 0, 3600, 60, 1, 0, 100, 1, 0, 0, 3600, 60, 1, 0));
+    // i32 lanes: [y, 0, hh*3600+mm*60, ss, | y, 0, ...]
+    let ok_a = (sep_ok & 0x1F) == 0x1F && (dig_ok & 0xFFFF) == 0xFFFF && (rng_ok & 0xFFFF) == 0xFFFF;
+    let ok_b = (sep_ok >> 16 & 0x1F) == 0x1F && (dig_ok >> 16) == 0xFFFF && (rng_ok >> 16) == 0xFFFF;
+    let fin = |lane: usize| -> Option<i64> {
+        let (y, mo, dd, hms) = if lane == 0 {
+            (_mm256_extract_epi32(ym, 0) as i64, _mm256_extract_epi16(v, 2) as i64, _mm256_extract_epi16(v, 3) as i64,
+             _mm256_extract_epi32(ym, 2) as i64 + _mm256_extract_epi32(ym, 3) as i64)
+        } else {
+            (_mm256_extract_epi32(ym, 4) as i64, _mm256_extract_epi16(v, 10) as i64, _mm256_extract_epi16(v, 11) as i64,
+             _mm256_extract_epi32(ym, 6) as i64 + _mm256_extract_epi32(ym, 7) as i64)
+        };
+        let days = if (YMIN..YMIN + YN as i64).contains(&y) {
+            let t = &*TABLES;
+            let i = (y - YMIN) as usize * 12 + mo as usize - 1;
+            if dd > t.mlen[i] as i64 {
+                return None;
+            }
+            t.days[i] as i64 + dd - 1
+        } else {
+            let mdays = match mo {
+                2 => if is_leap(y) { 29 } else { 28 },
+                4 | 6 | 9 | 11 => 30,
+                _ => 31,
+            };
+            if dd > mdays {
+                return None;
+            }
+            days_from_civil(y, mo, dd)
+        };
+        Some(days * DAY_MS + hms * 1000)
+    };
+    (if ok_a { fin(0) } else { None }, if ok_b { fin(1) } else { None })
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    /// splitmix64
+    fn rng(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn gen(s: &mut u64) -> Vec<u8> {
+        let r = rng(s);
+        let y = match r % 6 { 0 => 1899 + (rng(s) % 3) as i64, 1 => 2299 + (rng(s) % 3) as i64, 2 => (rng(s) % 10000) as i64, _ => 2024 + (rng(s) % 6) as i64 };
+        let mo = if rng(s) % 8 == 0 { rng(s) % 100 } else { 1 + rng(s) % 12 };
+        let dd = if rng(s) % 8 == 0 { rng(s) % 100 } else { 28 + rng(s) % 4 };
+        let hh = if rng(s) % 8 == 0 { rng(s) % 100 } else { rng(s) % 24 };
+        let mi = if rng(s) % 8 == 0 { rng(s) % 100 } else { rng(s) % 60 };
+        let ss = if rng(s) % 8 == 0 { rng(s) % 100 } else { rng(s) % 60 };
+        let mut v = format!("{y:04}-{mo:02}-{dd:02}T{hh:02}:{mi:02}:{ss:02}Z").into_bytes();
+        match rng(s) % 10 {
+            0 => { let i = (rng(s) % 20) as usize; v[i] = b"0123456789-T:Zz t+/\xd9\xa0 a"[(rng(s) % 23) as usize]; }
+            1 => { let i = (rng(s) % 20) as usize; v[i] ^= 1 << (rng(s) % 8); }
+            2 => { v = format!("{}", 1_700_000_000_000u64 + rng(s) % 400_000_000_000).into_bytes(); } // F3
+            3 => { v.truncate(19); v.extend_from_slice(b"+05:30"); } // F2
+            4 => { v.push(b'Z'); } // 21 bytes
+            5 => { v.pop(); v.push(b'z'); }
+            _ => {}
+        }
+        v
+    }
+    #[test]
+    fn pair_matches_scalar() {
+        let mut s = 12345u64;
+        let mut buf = vec![0u8; 0];
+        for round in 0..2_000_000u32 {
+            let a = gen(&mut s);
+            let b = gen(&mut s);
+            buf.clear();
+            buf.extend_from_slice(b"x,");
+            let ao = buf.len();
+            buf.extend_from_slice(&a);
+            buf.push(b',');
+            let bo = buf.len();
+            buf.extend_from_slice(&b);
+            buf.extend_from_slice(b",view,p1,\n");
+            buf.extend_from_slice(&[0u8; 64]);
+            let (fa, fb) = (&buf[ao..ao + a.len()], &buf[bo..bo + b.len()]);
+            let want = (parse_ts_in(&buf, fa), parse_ts_in(&buf, fb));
+            let got = parse_ts_pair(&buf, fa, fb);
+            assert_eq!(got, want, "round {round}: {:?} {:?}", String::from_utf8_lossy(fa), String::from_utf8_lossy(fb));
+            // also against the plain scalar parser
+            assert_eq!(want, (parse_ts(fa), parse_ts(fb)));
+        }
+    }
+    #[test]
+    fn pair_edges() {
+        let cases: &[&[u8]] = &[b"2028-02-29T23:59:59Z", b"2027-02-29T10:00:00Z", b"2026-02-30T00:00:00Z", b"2026-13-01T00:00:00Z",
+            b"2026-00-10T00:00:00Z", b"2026-10-00T00:00:00Z", b"2026-10-03T24:00:00Z", b"2026-10-03T23:60:00Z", b"2026-10-03T23:59:60Z",
+            b"1899-12-31T23:59:59Z", b"2300-01-01T00:00:00Z", b"0000-01-01T00:00:00Z", b"9999-12-31T23:59:59Z", b"2026-10-03 10:00:00Z",
+            b"2026-10-03t10:00:00Z", b"2026-10-03T10:00:00z", b"2026-10-03T10:00:00\rZ", b"2026-04-31T00:00:00Z", b"2000-02-29T00:00:00Z", b"1900-02-29T00:00:00Z"];
+        for a in cases { for b in cases {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(a); buf.push(b','); buf.extend_from_slice(b); buf.extend_from_slice(&[0u8; 64]);
+            let (fa, fb) = (&buf[..a.len()], &buf[a.len() + 1..a.len() + 1 + b.len()]);
+            assert_eq!(parse_ts_pair(&buf, fa, fb), (parse_ts(fa), parse_ts(fb)), "{:?} {:?}", String::from_utf8_lossy(fa), String::from_utf8_lossy(fb));
+        }}
+    }
+}
