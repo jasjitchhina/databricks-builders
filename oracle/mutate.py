@@ -3,7 +3,9 @@
 Usage: mutate.py BASE_REV [MUTANT_ID ...]
 Each mutant = one exact-string replacement in a pristine `git archive BASE_REV fast` copy. It is
 built (shared incremental target dir) and attacked in tiers, cheapest first; the first failing tier
-KILLS it:  T1 36 fixtures | T2 every 1M/adv set with an oracle answer | T3 300 fuzz seeds | T4 20M sets.
+KILLS it:  T0 cargo test --lib (unit tests: kernels, differential fuzz vs scalar/spec) | T1 36 fixtures |
+T2 every 1M/adv set with an oracle answer | T3 300 fuzz seeds | T4 20M sets. MUT_NO_T0=1 skips T0.
+Builds and tests take the shared bench lock (flock -s /tmp/bench.lock).
 Results append to $MUT_LOG (default ~/data/scratch/mutants.tsv). Run under taskset -c 8-15,24-31."""
 import os
 import shutil
@@ -131,15 +133,22 @@ def main():
             if os.path.isfile(p):
                 shutil.copy(p, os.path.join(work, "fast/src", g))
         open(dst, "w").write(mut)
-        rc, o = sh(f"cd {work}/fast && CARGO_TARGET_DIR={tgt} cargo build --release --offline --bin fast 2>&1", timeout=900)
+        rc, o = sh(f"cd {work}/fast && CARGO_TARGET_DIR={tgt} flock -s /tmp/bench.lock cargo build --release --offline --bin fast 2>&1", timeout=900)
         if rc != 0:
             res, why = "BUILD_FAIL", o.strip().splitlines()[-1][:120]
         else:
             b = os.path.join(W, f"bin-{mid}")
             shutil.copy(os.path.join(tgt, "release/fast"), b)
             res, why = "SURVIVED", ""
-            rc, o = sh(f"{env} python3 {REPO}/scripts/run_fixtures.py {REPO}/fixtures -- timeout 60 {b}", timeout=900)
-            if rc != 0:
+            if not os.environ.get("MUT_NO_T0"):
+                # T0: unit tests (cheapest kill for kernel mutants: ts/csv/keys differential tests)
+                rc, o = sh(f"cd {work}/fast && CARGO_TARGET_DIR={tgt} flock -s /tmp/bench.lock cargo test --release --offline --lib 2>&1", timeout=1800)
+                if rc != 0:
+                    fails = [l.split()[1] for l in o.splitlines() if l.startswith("test ") and l.rstrip().endswith("FAILED")]
+                    res, why = "KILLED_T0", ("unit " + ",".join(fails))[:120] if fails else "unit tests: " + (o.strip().splitlines() or ["?"])[-1][:100]
+            if res == "SURVIVED":
+                rc, o = sh(f"{env} python3 {REPO}/scripts/run_fixtures.py {REPO}/fixtures -- timeout 60 {b}", timeout=900)
+            if res == "SURVIVED" and rc != 0:
                 fails = [l.split()[1] for l in o.splitlines() if l.startswith("FAIL")]
                 res, why = "KILLED_T1", "fixtures " + ",".join(sorted(set(fails)))[:100]
             if res == "SURVIVED":
