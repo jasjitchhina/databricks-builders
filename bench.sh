@@ -182,17 +182,17 @@ for DS in "${DATASETS[@]}"; do
     RT=(); RCHECK=MATCH; RCACHE=""; BYTES=""; mv "$WORK/out" "$WORK/out-cold"
     ENTRY=$(ls -1 "$WORK/scratch/.fastcache" 2>/dev/null | grep -vc '\.tmp\.' || true)
     for ((r=1; r<=REPLAY; r++)); do
-      rm -rf "$WORK/out" 2>/dev/null; mkdir -p "$WORK/out"; chmod 777 "$WORK/out"
-      run_one "$WORK/out" "$WORK/scratch" "replay$r" "replay $r" || exit 1
+      RO="$WORK/out-replay$r"; mkdir -p "$RO"; chmod 777 "$RO"   # own dir per replay (uid-1000 files: no rm under set -e)
+      run_one "$RO" "$WORK/scratch" "replay$r" "replay $r" || exit 1
       RT+=("$CT")
       c=$("$ROOT/harness/cacheline" "$WORK/log-replay$r.txt" | sed 's/^cache: //' | cut -d' ' -f1)
       RCACHE="$RCACHE${RCACHE:+,}${c:-?}"
-      docker run --rm --network none --user 0:0 -v "$WORK":/w --entrypoint chmod "${HELPER_IMAGE:-python:3.12-slim-bookworm}" -R a+rX /w/out /w/out-cold >/dev/null 2>&1 || true
+      docker run --rm --network none --user 0:0 -v "$WORK":/w --entrypoint chmod "${HELPER_IMAGE:-python:3.12-slim-bookworm}" -R a+rX "/w/out-replay$r" /w/out-cold >/dev/null 2>&1 || true
       # a hit must be byte-identical to the stored run; a full run is not (part files depend on thread timing)
-      if diff -rq "$WORK/out-cold" "$WORK/out" > "$WORK/rdiff.txt" 2>&1; then BYTES="${BYTES}same,"; else BYTES="${BYTES}differ,"
+      if diff -rq "$WORK/out-cold" "$RO" > "$WORK/rdiff.txt" 2>&1; then BYTES="${BYTES}same,"; else BYTES="${BYTES}differ,"
         case "$c" in hit*) RCHECK=HIT-NOT-BYTE-IDENTICAL; head -5 "$WORK/rdiff.txt" >&2;; esac; fi
       if [ -d "$DATA_ROOT/oracle/$NAME/out/user_daily" ]; then
-        PYTHONPATH=$HOME/pylib python3 "$ROOT/scripts/compare.py" "$WORK/out" "$DATA_ROOT/oracle/$NAME/out" > "$WORK/rcmp.txt" 2>&1 || { RCHECK=DIFFER; cat "$WORK/rcmp.txt" >&2; }
+        PYTHONPATH=$HOME/pylib python3 "$ROOT/scripts/compare.py" "$RO" "$DATA_ROOT/oracle/$NAME/out" > "$WORK/rcmp.txt" 2>&1 || { RCHECK=DIFFER; cat "$WORK/rcmp.txt" >&2; }
       fi
     done
     [ -d "$DATA_ROOT/oracle/$NAME/out/user_daily" ] || [ "$RCHECK" != MATCH ] || RCHECK=no-oracle
