@@ -115,6 +115,11 @@ pub struct Part {
     /// valid clicks (not deduped: copies are identical), unsorted. Only clicks
     /// of persons that have at least one surviving event are included.
     pub cl: Rows<Cl>,
+    /// rows per part-local person (len == person_names.len()) when the producer
+    /// counted them while writing `ev` / `cl`; empty = the engine counts itself.
+    /// Saves the engine group a full re-read of the part (memory-bound at 60M).
+    pub ev_cnt: Vec<u32>,
+    pub cl_cnt: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -188,11 +188,15 @@ fn sort_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
     }
 }
 pub static RADIX_MIN: AtomicU64 = AtomicU64::new(512);
+/// A/B switch (FAST_NO_PART_CNT): ignore Part::ev_cnt/cl_cnt and count in the engine.
+pub static NO_PART_CNT: AtomicU64 = AtomicU64::new(0);
 
 /// counting sort of items by person into `out` (mapped), offsets into `off` (len np+1)
+/// `cnt`: per-person counts from the producer (len np), or empty to count here.
 fn group<T: Copy, U: Copy>(
     items: &[T],
     np: usize,
+    cnt: &[u32],
     key: impl Fn(&T) -> u32,
     map: impl Fn(usize, &T) -> U,
     off: &mut Vec<u32>,
@@ -200,12 +204,18 @@ fn group<T: Copy, U: Copy>(
 ) {
     off.clear();
     off.resize(np + 1, 0);
-    for it in items {
-        off[key(it) as usize + 1] += 1;
+    if cnt.len() == np && np > 0 && NO_PART_CNT.load(Relaxed) == 0 {
+        off[1..].copy_from_slice(cnt);
+    } else {
+        for it in items {
+            off[key(it) as usize + 1] += 1;
+        }
     }
     for i in 0..np {
         off[i + 1] += off[i];
     }
+    // the scatter below trusts the offsets: the totals must agree
+    assert_eq!(off[np] as usize, items.len(), "group: person counts do not match the part");
     out.clear();
     out.reserve(items.len());
     // scatter using a cursor copy
@@ -362,8 +372,8 @@ impl Worker {
         let t0 = std::time::Instant::now();
         let variant = VARIANT.load(Relaxed);
         if ctx.packable && part.cl.len() < (1 << 21) {
-            group(&part.ev, np, |e| e.person, |_, e| PEv(((e.ts as u64) << 33) | ((e.price as u64) << 9) | e.cat as u64), &mut s.eoff, &mut s.pevs);
-            group(&part.cl, np, |e| e.person, |i, e| PCl(((e.ts as u64) << 33) | ((e.camp as u64) << 21) | i as u64), &mut s.coff, &mut s.pcls);
+            group(&part.ev, np, &part.ev_cnt, |e| e.person, |_, e| PEv(((e.ts as u64) << 33) | ((e.price as u64) << 9) | e.cat as u64), &mut s.eoff, &mut s.pevs);
+            group(&part.cl, np, &part.cl_cnt, |e| e.person, |i, e| PCl(((e.ts as u64) << 33) | ((e.camp as u64) << 21) | i as u64), &mut s.coff, &mut s.pcls);
             let mut evs = std::mem::take(&mut s.pevs);
             let mut cls = std::mem::take(&mut s.pcls);
             T_GROUP.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
@@ -389,8 +399,8 @@ impl Worker {
             s.pevs = evs;
             s.pcls = cls;
         } else {
-            group(&part.ev, np, |e| e.person, |_, e| *e, &mut s.eoff, &mut s.evs);
-            group(&part.cl, np, |e| e.person, |_, e| *e, &mut s.coff, &mut s.cls);
+            group(&part.ev, np, &part.ev_cnt, |e| e.person, |_, e| *e, &mut s.eoff, &mut s.evs);
+            group(&part.cl, np, &part.cl_cnt, |e| e.person, |_, e| *e, &mut s.coff, &mut s.cls);
             let mut evs = std::mem::take(&mut s.evs);
             let mut cls = std::mem::take(&mut s.cls);
             for p in 0..np {
@@ -464,6 +474,9 @@ pub fn merge(ctx: &Ctx, results: Vec<WorkerOut>) -> Output {
 /// Runs the back half over an already-built `Cleaned`. If `user_dir` is given, each
 /// worker writes its user_daily rows to `user_dir/part-<w>.parquet`.
 pub fn run(c: &Cleaned, dump: bool, user_dir: Option<&Path>) -> Output {
+    if std::env::var_os("FAST_NO_PART_CNT").is_some() {
+        NO_PART_CNT.store(1, Relaxed);
+    }
     let ctx = Ctx::new(c.base_ms, c.ws_ms, c.we_ms, &c.cat_names, &c.camp_ids, dump);
     // process largest parts first for load balance
     let mut order: Vec<usize> = (0..c.parts.len()).collect();

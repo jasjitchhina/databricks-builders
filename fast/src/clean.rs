@@ -767,15 +767,18 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                 }
             };
             let mut ne = 0usize;
+            let mut ev_cnt: Vec<u32> = Vec::new();
             for (_, _, _, o, _, pside, _) in deduped.iter() {
                 o.each(p, |_, r| {
                     let id = match local.get_or_insert(r.person, names.len() as u32) {
                         Some(v) => v,
                         None => {
                             names.push(r.person);
+                            ev_cnt.push(0);
                             (names.len() - 1) as u32
                         }
                     };
+                    unsafe { *ev_cnt.get_unchecked_mut(id as usize) += 1 };
                     let (price, cat) = if r.pc == 0 {
                         (0, 0)
                     } else if small_cat {
@@ -803,9 +806,11 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                 }
             };
             let mut nc = 0usize;
+            let mut cl_cnt: Vec<u32> = vec![0; names.len()];
             for s in states.iter() {
                 s.cl.each(p, |_, r| {
                     if let Some(v) = local.get(r.person) {
+                        unsafe { *cl_cnt.get_unchecked_mut(v as usize) += 1 };
                         unsafe { cl_ptr.add(nc).write(Cl { click_id: r.cid.click(), person: v, ts: r.ts, camp: r.camp }) };
                         nc += 1;
                     }
@@ -822,7 +827,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             for &k in names.iter() {
                 person_names.push_with(|b| k.append_bytes(b));
             }
-            *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl });
+            *parts_ref[p].lock().unwrap() = Some(Part { person_names, ev, cl, ev_cnt, cl_cnt });
         });
         // Donate what is dead and already faulted in (click regions, part-record
         // regions, unused arena tails) to the global allocator (alloc::DonorAlloc)
