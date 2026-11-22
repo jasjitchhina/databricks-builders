@@ -28,6 +28,9 @@ fn main() {
     let cache_log = std::env::var_os("FAST_VERBOSE").is_some();
     let mut fp_now: Option<String> = None;
     let mut fp_bg: Option<std::thread::JoinHandle<Option<String>>> = None;
+    if !fast::cache::disabled() {
+        fast::cache::enable_notes();
+    }
     if fast::cache::disabled() {
         if cache_log {
             eprintln!("[cache] off: disabled");

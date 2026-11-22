@@ -429,7 +429,8 @@ impl Worker {
         if let Some(dir) = user_dir {
             if sc.urows > 0 || w == 0 {
                 let bytes = pq::encode(&sc.ucols, sc.urows);
-                std::fs::write(dir.join(format!("part-{w}.parquet")), bytes).expect("write user_daily");
+                std::fs::write(dir.join(format!("part-{w}.parquet")), &bytes).expect("write user_daily");
+                crate::cache::note(&format!("user_daily/part-{w}.parquet"), &bytes);
             }
         }
         let (ncamp, ndays) = (ctx.ncamp, ctx.ndays);

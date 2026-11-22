@@ -488,6 +488,25 @@ fn listing(out: &Path) -> Option<Vec<(String, u64)>> {
     Some(v)
 }
 
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static NOTED: Mutex<Vec<(String, u64, [u8; 32])>> = Mutex::new(Vec::new());
+
+/// Turns on output hashing for the store (call once, only when a store may follow).
+pub fn enable_notes() {
+    ENABLED.store(true, SeqCst);
+}
+
+/// Records the content hash of output file `rel` = `bytes` (call right after writing it).
+pub fn note(rel: &str, bytes: &[u8]) {
+    if !ENABLED.load(SeqCst) {
+        return;
+    }
+    let mut h = FH::new();
+    h.update(bytes);
+    let hx = h.hex();
+    NOTED.lock().unwrap_or_else(|e| e.into_inner()).push((rel.to_string(), bytes.len() as u64, hx));
+}
+
 /// Any entry (or leftover) in SCRATCH_DIR/.fastcache? If not, a hit is impossible and the
 /// fingerprint can be computed off the critical path.
 pub fn any_entry() -> bool {
@@ -506,7 +525,6 @@ pub fn any_entry() -> bool {
 
 const MAXF: usize = 64;
 const PATHB: usize = 1024;
-const RELB: usize = 40;
 const STORE_THREADS: usize = 4;
 const SBUF: usize = 1 << 20;
 struct Plan {
@@ -514,13 +532,10 @@ struct Plan {
     src: [i32; MAXF],
     dst: [i32; MAXF],
     size: [u64; MAXF],
-    rel: [[u8; RELB]; MAXF],
-    rel_len: [usize; MAXF],
-    hash: [[u8; 32]; MAXF],
     ok_path: [u8; PATHB],
     tmp_dir: [u8; PATHB],
     fin_dir: [u8; PATHB],
-    /// rendered "VERSION\nfp ..\nn ..\n"; the file lines + "end\n" are appended at publish
+    /// the complete OK file, rendered before the store threads start
     ok: [u8; 8192],
     ok_len: usize,
 }
@@ -529,9 +544,6 @@ static mut PLAN: Plan = Plan {
     src: [-1; MAXF],
     dst: [-1; MAXF],
     size: [0; MAXF],
-    rel: [[0; RELB]; MAXF],
-    rel_len: [0; MAXF],
-    hash: [[0; 32]; MAXF],
     ok_path: [0; PATHB],
     tmp_dir: [0; PATHB],
     fin_dir: [0; PATHB],
@@ -582,17 +594,28 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
             let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
         }
         let v = listing(out)?;
-        if v.is_empty() || v.len() > MAXF || v.iter().any(|(r, _)| !valid_rel(r) || r.len() > RELB) {
+        if v.is_empty() || v.len() > MAXF {
             return None;
         }
-        let head = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
+        // every output file must have been hashed from the bytes written to it
+        let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        noted.sort();
+        if noted.len() != v.len() || noted.iter().zip(&v).any(|(a, b)| a.0 != b.0 || a.1 != b.1) {
+            return None;
+        }
+        let mut okv = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
+        for (rel, sz, hx) in &noted {
+            okv.push_str(&format!("{sz}\t{}\t{rel}\n", std::str::from_utf8(hx).ok()?));
+        }
+        okv.push_str("end\n");
+        parse_ok(&okv, fp)?; // never publish what replay would reject
         let tmp = base.join(format!("{fp}.tmp.{}", std::process::id()));
         std::fs::create_dir(&tmp).ok()?;
         std::fs::create_dir(tmp.join("user_daily")).ok()?;
         std::fs::create_dir(tmp.join("campaign_daily")).ok()?;
         // SAFETY: single-threaded here (no store thread exists yet)
         let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
-        if head.len() + v.len() * (20 + 1 + 32 + 1 + RELB + 1) + 4 > plan.ok.len() {
+        if okv.len() > plan.ok.len() {
             return None;
         }
         for (i, (rel, sz)) in v.iter().enumerate() {
@@ -604,15 +627,13 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
             plan.src[i] = src.into_raw_fd();
             plan.dst[i] = dst.into_raw_fd();
             plan.size[i] = *sz;
-            plan.rel[i][..rel.len()].copy_from_slice(rel.as_bytes());
-            plan.rel_len[i] = rel.len();
             plan.n = i + 1;
         }
         cpath(&mut plan.ok_path, &tmp.join("OK"))?;
         cpath(&mut plan.tmp_dir, &tmp)?;
         cpath(&mut plan.fin_dir, &base.join(fp))?;
-        plan.ok[..head.len()].copy_from_slice(head.as_bytes());
-        plan.ok_len = head.len();
+        plan.ok[..okv.len()].copy_from_slice(okv.as_bytes());
+        plan.ok_len = okv.len();
         Some(())
     })();
     if r.is_some() {
@@ -624,22 +645,33 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
     }
 }
 
-/// Copies planned file i through `buf` (pread / hash / pwrite). true = exact length.
-fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF], hash: &mut [u8; 32]) -> bool {
+/// Copies planned file i (copy_file_range; pread/pwrite through `buf` if the kernel
+/// refuses). true = exactly `size` bytes copied and neither file has another length.
+fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF]) -> bool {
     let (src, dst, size) = (plan.src[i], plan.dst[i], plan.size[i]);
-    let mut h = FH::new();
     let mut done: u64 = 0;
+    let mut kernel = true;
     while done < size {
         if FAIL.load(SeqCst) {
             return false;
         }
-        let k = ((size - done) as usize).min(SBUF);
+        let want = ((size - done) as usize).min(1 << 30);
+        if kernel {
+            let mut oi = done as i64;
+            let mut oo = done as i64;
+            let r = unsafe { libc::copy_file_range(src, &mut oi, dst, &mut oo, want, 0) };
+            if r > 0 {
+                done += r as u64;
+                continue;
+            }
+            kernel = false; // EXDEV / ENOSYS / EINVAL / 0: copy by hand from here
+        }
+        let k = want.min(SBUF);
         let r = unsafe { libc::pread(src, buf.as_mut_ptr() as *mut libc::c_void, k, done as i64) };
         if r <= 0 {
             return false;
         }
         let r = r as usize;
-        h.update(&buf[..r]);
         let mut w = 0usize;
         while w < r {
             let x = unsafe { libc::pwrite(dst, buf.as_ptr().add(w) as *const libc::c_void, r - w, (done + w as u64) as i64) };
@@ -650,41 +682,12 @@ fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF], hash: &mut [u8; 32]) -
         }
         done += r as u64;
     }
-    // the source must not have grown, the copy must have exactly `size` bytes
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let mut ss: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(dst, &mut st) } != 0 || unsafe { libc::fstat(src, &mut ss) } != 0 {
         return false;
     }
-    if st.st_size as u64 != size || ss.st_size as u64 != size {
-        return false;
-    }
-    *hash = h.hex();
-    true
-}
-
-/// Appends b to plan.ok (no heap). false = no room.
-fn ok_push(plan: &mut Plan, b: &[u8]) -> bool {
-    if plan.ok_len + b.len() > plan.ok.len() {
-        return false;
-    }
-    plan.ok[plan.ok_len..plan.ok_len + b.len()].copy_from_slice(b);
-    plan.ok_len += b.len();
-    true
-}
-
-fn ok_push_u64(plan: &mut Plan, mut x: u64) -> bool {
-    let mut d = [0u8; 20];
-    let mut k = 20;
-    loop {
-        k -= 1;
-        d[k] = b'0' + (x % 10) as u8;
-        x /= 10;
-        if x == 0 {
-            break;
-        }
-    }
-    ok_push(plan, &d[k..])
+    st.st_size as u64 == size && ss.st_size as u64 == size
 }
 
 /// Store worker `t` (< STORE_THREADS): syscalls only (no heap, no stdio), safe to run
@@ -693,32 +696,23 @@ pub fn store_work(t: usize) {
     if STATE.load(SeqCst) != 1 || t >= STORE_THREADS {
         return;
     }
-    // SAFETY: plan fields read here are immutable once STATE == 1, except hash[i]
-    // (written only by the thread that took index i) and ok/ok_len (only by the
-    // single publishing thread, after every hash is written: DONE is SeqCst).
-    let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
+    // SAFETY: the plan is immutable once STATE == 1
+    let plan = unsafe { &*std::ptr::addr_of!(PLAN) };
     let buf = unsafe { &mut (*std::ptr::addr_of_mut!(SBUFS))[t] };
     loop {
         let i = NEXT.fetch_add(1, SeqCst);
         if i >= plan.n {
             return;
         }
-        let mut hx = [0u8; 32];
-        if !store_one(plan, i, buf, &mut hx) {
+        if !store_one(plan, i, buf) {
             FAIL.store(true, SeqCst);
         }
-        plan.hash[i] = hx;
         unsafe {
             libc::close(plan.src[i]);
             libc::close(plan.dst[i]);
         }
         if DONE.fetch_add(1, SeqCst) + 1 == plan.n {
-            let mut ok = !FAIL.load(SeqCst);
-            for j in 0..plan.n {
-                let (rel, rl, hj, sz) = (plan.rel[j], plan.rel_len[j], plan.hash[j], plan.size[j]);
-                ok = ok && ok_push_u64(plan, sz) && ok_push(plan, b"\t") && ok_push(plan, &hj) && ok_push(plan, b"\t") && ok_push(plan, &rel[..rl]) && ok_push(plan, b"\n");
-            }
-            ok = ok && ok_push(plan, b"end\n");
+            let ok = !FAIL.load(SeqCst);
             let ok = ok && unsafe {
                 let fd = libc::open(plan.ok_path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o644);
                 fd >= 0 && {
