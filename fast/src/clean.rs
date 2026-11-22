@@ -604,7 +604,7 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
     let deduped = par_items(
         threads,
         nb,
-        |_| (Vec::<u64>::new(), Vec::<(K, u64, u32, u32, u32)>::new(), Vec::<(u64, u32, ERec<K>)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u32)>::new(), Vec::<u64>::new()),
+        |_| (Vec::<u64>::new(), Vec::<(K, u32, u32)>::new(), Vec::<(u64, u32, ERec<K>)>::new(), WcRegions::<PRec<K>, 4>::new_with(NPART, out_cap, huge), Vec::<u8>::new(), Vec::<(u32, u32)>::new(), Vec::<u64>::new()),
         |(table, surv, cand, out, cnt, pside, hs), b| {
             let _fence = Defer(crate::alloc::sfence);
             let n: usize = states.iter().map(|s| s.ev.len_of(b)).sum();
@@ -642,8 +642,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                     let i = (h >> nb_bits) as usize & cmask;
                     if (unsafe { *cnt.get_unchecked(i >> 2) } >> ((i & 3) * 2)) & 3 == 1 {
                         if r.ts != NOT_OK {
-                            let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
-                            surv.push((r.user, r.user.hash(), r.ts, price, cat));
+                            let pc = if r.pc == 0 { 0 } else { pack_pc(s.side[r.pc as usize - 1], small_cat, pside) };
+                            surv.push((r.user, r.ts, pc));
                         }
                     } else {
                         cand.push((h, ti as u32, *r));
@@ -690,8 +690,8 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
                     continue;
                 }
                 let s = unsafe { states.get_unchecked(*ti as usize) };
-                let (price, cat) = if r.pc == 0 { (0, 0) } else { s.side[r.pc as usize - 1] };
-                surv.push((r.user, r.user.hash(), r.ts, price, cat));
+                let pc = if r.pc == 0 { 0 } else { pack_pc(s.side[r.pc as usize - 1], small_cat, pside) };
+                surv.push((r.user, r.ts, pc));
             }
             let _q2 = Instant::now();
             let n = surv.len();
@@ -699,45 +699,39 @@ fn clean_impl<K: IdKey>(dir: &Path, threads: usize, small_cell: &std::sync::Once
             // 3-stage pipeline: filter word prefetch (j+2PF), filter test + slot
             // prefetch (j+PF), lookup (j); filter bits computed once per row.
             const RM: usize = 63;
-            let mut ring = [(0usize, 0u64, false); RM + 1];
+            let mut ring = [(0usize, 0u64, false, 0u64); RM + 1];
             for j in 0..(2 * PF).min(n) {
-                let (w, bb) = links.fbits_h(unsafe { surv.get_unchecked(j) }.1);
+                let h = unsafe { surv.get_unchecked(j) }.0.hash();
+                let (w, bb) = links.fbits_h(h);
                 links.filter_prefetch_w(w);
-                ring[j & RM] = (w, bb, false);
+                ring[j & RM] = (w, bb, false, h);
             }
             for j in 0..PF.min(n) {
                 let e = &mut ring[j & RM];
                 e.2 = links.filter_test_w(e.0, e.1);
                 if e.2 {
-                    links.slot_prefetch_h(unsafe { surv.get_unchecked(j) }.1);
+                    links.slot_prefetch_h(e.3);
                 }
             }
             for j in 0..n {
                 if j + 2 * PF < n {
-                    let (w, bb) = links.fbits_h(unsafe { surv.get_unchecked(j + 2 * PF) }.1);
+                    let h = unsafe { surv.get_unchecked(j + 2 * PF) }.0.hash();
+                    let (w, bb) = links.fbits_h(h);
                     links.filter_prefetch_w(w);
-                    ring[(j + 2 * PF) & RM] = (w, bb, false);
+                    ring[(j + 2 * PF) & RM] = (w, bb, false, h);
                 }
                 if j + PF < n {
                     let e = &mut ring[(j + PF) & RM];
                     e.2 = links.filter_test_w(e.0, e.1);
                     if e.2 {
-                        links.slot_prefetch_h(unsafe { surv.get_unchecked(j + PF) }.1);
+                        links.slot_prefetch_h(e.3);
                     }
                 }
-                let (user, h, ts, price, cat) = unsafe { *surv.get_unchecked(j) };
-                let maybe = ring[j & RM].2;
+                let (user, ts, pc) = unsafe { *surv.get_unchecked(j) };
+                let (_, _, maybe, h) = ring[j & RM];
                 let (person, ph) = match if maybe { links.get_slot_h(user, h) } else { None } {
                     Some(nm) => (nm, nm.hash()),
                     None => (user, h),
-                };
-                let pc = if price == 0 {
-                    0
-                } else if small_cat {
-                    price | (cat as u32) << 24
-                } else {
-                    pside.push((price, cat));
-                    pside.len() as u32
                 };
                 out.push(part_of_h(ph), PRec { person, ts, pc });
             }
@@ -959,6 +953,19 @@ fn parse_event<K: IdKey>(m: &[u8], f: [&[u8]; 7], ws: i64, we: i64, base: i64, l
         rec.ts = (t - base) as u32;
     }
     Ok(Some(rec))
+}
+
+#[inline(always)]
+/// PRec `pc` of a purchase: price | cat << 24 when categories fit 8 bits,
+/// else 1 + index into the dedup thread's side table.
+#[inline(always)]
+fn pack_pc((price, cat): (u32, u32), small_cat: bool, pside: &mut Vec<(u32, u32)>) -> u32 {
+    if small_cat {
+        price | cat << 24
+    } else {
+        pside.push((price, cat));
+        pside.len() as u32
+    }
 }
 
 #[inline(always)]
