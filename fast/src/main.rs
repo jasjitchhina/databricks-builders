@@ -122,7 +122,7 @@ fn main() {
         zap_and_exit(&data, nthreads, std::env::var_os("FAST_NO_ZAP_ANON").is_none(), verbose);
     }
     if store {
-        fast::cache::store_work();
+        fast::cache::store_work(0);
         if cache_log {
             eprintln!("[cache] stored: {}", fast::cache::store_wait(0));
         }
@@ -209,14 +209,14 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     let nt = nthreads.clamp(1, 16);
     // cache store threads (syscalls only) copy the outputs into SCRATCH_DIR during the zap
     // (like the zap threads: publish stack + TLS, never return: thread exit would free heap)
-    let ns = fast::cache::store_files().min(4);
+    let ns = fast::cache::store_threads();
     for t in 0..ns {
         std::thread::spawn(move || {
             let probe = 0u8;
             STORE_KEEP[2 * t].store(std::hint::black_box(&probe) as *const u8 as usize, SeqCst);
             STORE_KEEP[2 * t + 1].store(tls_addr(), SeqCst);
             STORE_READY.fetch_add(1, SeqCst);
-            fast::cache::store_work();
+            fast::cache::store_work(t);
             loop {
                 unsafe { libc::pause() };
             }

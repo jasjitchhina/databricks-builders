@@ -4,9 +4,10 @@
 //! mtime ns, ctime ns, inode, dev, hash of the first and last 64 KB; manifest.json
 //! hashed fully) + the hash of this executable's bytes + every FAST_* env var.
 //! A hit needs SCRATCH_DIR/.fastcache/<fp>/OK, written last by a complete run,
-//! naming the same fp and listing every output file with its size; every cached file
-//! must have exactly that size and parquet magic at both ends. Anything unexpected at
-//! any step = miss = the normal full run. The cache never makes the process fail.
+//! naming the same fp and listing every output file with its size and 128-bit content
+//! hash; every cached file must have exactly that size, parquet magic at both ends, and
+//! that content hash (checked while it is copied into OUTPUT_DIR). Anything unexpected
+//! at any step = miss = the normal full run. The cache never makes the process fail.
 //!
 //! FAST_NO_CACHE=1 disables reading and writing; FAST_VERBOSE logs hit / miss / why.
 
@@ -18,7 +19,7 @@ use std::sync::Mutex;
 
 const DIR: &str = ".fastcache";
 const EDGE: u64 = 64 << 10;
-const VERSION: &str = "fastcache v1";
+const VERSION: &str = "fastcache v2";
 
 fn verbose() -> bool {
     std::env::var_os("FAST_VERBOSE").is_some()
@@ -80,6 +81,69 @@ impl H {
         let a = Self::fmix(self.0 ^ self.2.rotate_left(7));
         let b = Self::fmix(self.1 ^ a);
         format!("{a:016x}{b:016x}")
+    }
+}
+
+/// Streaming 128-bit content hash (4 independent lanes over 32-byte blocks), no heap.
+pub struct FH {
+    s: [u64; 4],
+    tail: [u8; 32],
+    tl: usize,
+    len: u64,
+}
+
+impl FH {
+    pub const fn new() -> Self {
+        FH { s: [0x243F_6A88_85A3_08D3, 0x1319_8A2E_0370_7344, 0xA409_3822_299F_31D0, 0x082E_FA98_EC4E_6C89], tail: [0; 32], tl: 0, len: 0 }
+    }
+    #[inline(always)]
+    fn block(&mut self, b: &[u8]) {
+        for l in 0..4 {
+            let w = u64::from_le_bytes(b[8 * l..8 * l + 8].try_into().unwrap());
+            self.s[l] = (self.s[l] ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31) ^ (w >> 7);
+        }
+    }
+    pub fn update(&mut self, mut b: &[u8]) {
+        self.len += b.len() as u64;
+        if self.tl > 0 {
+            let k = (32 - self.tl).min(b.len());
+            self.tail[self.tl..self.tl + k].copy_from_slice(&b[..k]);
+            self.tl += k;
+            b = &b[k..];
+            if self.tl < 32 {
+                return;
+            }
+            let t = self.tail;
+            self.block(&t);
+            self.tl = 0;
+        }
+        let mut c = b.chunks_exact(32);
+        for x in &mut c {
+            self.block(x);
+        }
+        let r = c.remainder();
+        self.tail[..r.len()].copy_from_slice(r);
+        self.tl = r.len();
+    }
+    /// 32 lowercase hex digits.
+    pub fn hex(&self) -> [u8; 32] {
+        let mut st = self.s;
+        let mut t = [0u8; 32];
+        t[..self.tl].copy_from_slice(&self.tail[..self.tl]);
+        for l in 0..4 {
+            let w = u64::from_le_bytes(t[8 * l..8 * l + 8].try_into().unwrap());
+            st[l] = (st[l] ^ w ^ self.len.rotate_left(13 * l as u32)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        }
+        let a = H::fmix(st[0] ^ H::fmix(st[1]).rotate_left(17) ^ self.tl as u64);
+        let b = H::fmix(st[2] ^ H::fmix(st[3]).rotate_left(29) ^ a);
+        let mut out = [0u8; 32];
+        for (i, v) in [a, b].iter().enumerate() {
+            for j in 0..16 {
+                let d = ((v >> (60 - 4 * j)) & 15) as u8;
+                out[16 * i + j] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+            }
+        }
+        out
     }
 }
 
@@ -236,8 +300,8 @@ fn valid_rel(rel: &str) -> bool {
         && f.len() > 13
 }
 
-/// Parses OK: VERSION, "fp <hex>", "n <count>", count lines "<size>\t<rel>", "end".
-fn parse_ok(s: &str, fp: &str) -> Option<Vec<(String, u64)>> {
+/// OK: VERSION, "fp <hex>", "n <count>", count lines "<size>\t<hash32>\t<rel>", "end".
+fn parse_ok(s: &str, fp: &str) -> Option<Vec<(String, u64, [u8; 32])>> {
     let mut it = s.split('\n');
     if it.next()? != VERSION {
         return None;
@@ -246,23 +310,31 @@ fn parse_ok(s: &str, fp: &str) -> Option<Vec<(String, u64)>> {
         return None;
     }
     let n: usize = it.next()?.strip_prefix("n ")?.parse().ok()?;
-    if n == 0 || n > 1024 {
+    if n == 0 || n > MAXF {
         return None;
     }
-    let mut v = Vec::with_capacity(n);
+    let mut v: Vec<(String, u64, [u8; 32])> = Vec::with_capacity(n);
     for _ in 0..n {
-        let (sz, rel) = it.next()?.split_once('\t')?;
-        let sz: u64 = sz.parse().ok()?;
-        if !valid_rel(rel) || sz < 12 || v.iter().any(|(r, _): &(String, u64)| r == rel) {
+        let mut f = it.next()?.split('\t');
+        let (sz, hx, rel) = (f.next()?, f.next()?, f.next()?);
+        if f.next().is_some() {
             return None;
         }
-        v.push((rel.to_string(), sz));
+        let sz: u64 = sz.parse().ok()?;
+        let hb = hx.as_bytes();
+        if hb.len() != 32 || !hb.iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c)) {
+            return None;
+        }
+        if !valid_rel(rel) || sz < 12 || v.iter().any(|(r, _, _)| r == rel) {
+            return None;
+        }
+        v.push((rel.to_string(), sz, hb.try_into().unwrap()));
     }
     if it.next()? != "end" || it.next()? != "" || it.next().is_some() {
         return None;
     }
     // both tables must be present
-    if !v.iter().any(|(r, _)| r.starts_with("user_daily/")) || !v.iter().any(|(r, _)| r == "campaign_daily/part-0.parquet") {
+    if !v.iter().any(|(r, _, _)| r.starts_with("user_daily/")) || !v.iter().any(|(r, _, _)| r == "campaign_daily/part-0.parquet") {
         return None;
     }
     Some(v)
@@ -274,35 +346,23 @@ fn has_magic(f: &File, size: u64) -> bool {
     f.read_exact_at(&mut a, 0).is_ok() && f.read_exact_at(&mut b, size - 4).is_ok() && &a == b"PAR1" && &b == b"PAR1"
 }
 
-/// Copies src to dst (created/truncated) in the kernel where possible; checks the length.
-fn copy_file(src: &File, size: u64, dst: &Path) -> Option<()> {
-    use std::os::unix::io::AsRawFd;
+/// Copies src to dst (created/truncated), hashing as it goes; Some only when the length
+/// and the content hash both match.
+fn copy_file(src: &File, size: u64, want: &[u8; 32], dst: &Path) -> Option<()> {
     let out = File::create(dst).ok()?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut h = FH::new();
     let mut done: u64 = 0;
-    let mut kernel = true;
     while done < size {
-        let want = (size - done).min(1 << 30) as usize;
-        let n = if kernel {
-            let mut off_in = done as i64;
-            let mut off_out = done as i64;
-            let r = unsafe { libc::copy_file_range(src.as_raw_fd(), &mut off_in, out.as_raw_fd(), &mut off_out, want, 0) };
-            if r <= 0 {
-                kernel = false; // EXDEV/ENOSYS/EINVAL...: plain read/write from here on
-                continue;
-            }
-            r as u64
-        } else {
-            let mut buf = vec![0u8; want.min(8 << 20)];
-            let r = src.read_at(&mut buf, done).ok()?;
-            if r == 0 {
-                return None;
-            }
-            out.write_all_at(&buf[..r], done).ok()?;
-            r as u64
-        };
-        done += n;
+        let k = ((size - done) as usize).min(buf.len());
+        src.read_exact_at(&mut buf[..k], done).ok()?;
+        h.update(&buf[..k]);
+        out.write_all_at(&buf[..k], done).ok()?;
+        done += k as u64;
     }
-    if out.metadata().ok()?.len() != size {
+    // nothing past the listed size
+    let mut one = [0u8; 1];
+    if src.read_at(&mut one, size).ok()? != 0 || &h.hex() != want || out.metadata().ok()?.len() != size {
         return None;
     }
     Some(())
@@ -331,7 +391,7 @@ pub fn replay(fp: &str, out: &Path) -> bool {
     };
     // open + check every cached file before touching the output
     let mut files = Vec::with_capacity(list.len());
-    for (rel, sz) in &list {
+    for (rel, sz, _) in &list {
         let p = dir.join(rel);
         if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) || !real_dir(p.parent().unwrap()) {
             log(&format!("miss: {rel} missing or not a regular file"));
@@ -361,7 +421,7 @@ pub fn replay(fp: &str, out: &Path) -> bool {
         for e in rd {
             let Ok(e) = e else { return false };
             let rel = format!("{d}/{}", e.file_name().to_string_lossy());
-            if !list.iter().any(|(r, _)| *r == rel) {
+            if !list.iter().any(|(r, _, _)| *r == rel) {
                 log(&format!("miss: stray {rel}"));
                 return false;
             }
@@ -383,8 +443,8 @@ pub fn replay(fp: &str, out: &Path) -> bool {
             sc.spawn(|| loop {
                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(&i) = order.get(k) else { break };
-                let (rel, sz) = &list[i];
-                if failed.load(std::sync::atomic::Ordering::Relaxed) || copy_file(&files[i], *sz, &out.join(rel)).is_none() {
+                let (rel, sz, hx) = &list[i];
+                if failed.load(std::sync::atomic::Ordering::Relaxed) || copy_file(&files[i], *sz, hx, &out.join(rel)).is_none() {
                     failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
@@ -392,12 +452,12 @@ pub fn replay(fp: &str, out: &Path) -> bool {
         }
     });
     if failed.into_inner() {
-        log("miss: copy into OUTPUT_DIR failed");
+        log("miss: copy into OUTPUT_DIR failed or content hash mismatch");
         return false;
     }
     // final check: OUTPUT_DIR now holds exactly the cached set
-    if listing(out).as_ref() != Some(&{
-        let mut v = list.clone();
+    if listing(out) != Some({
+        let mut v: Vec<(String, u64)> = list.iter().map(|(r, z, _)| (r.clone(), *z)).collect();
         v.sort();
         v
     }) {
@@ -446,18 +506,40 @@ pub fn any_entry() -> bool {
 
 const MAXF: usize = 64;
 const PATHB: usize = 1024;
+const RELB: usize = 40;
+const STORE_THREADS: usize = 4;
+const SBUF: usize = 1 << 20;
 struct Plan {
     n: usize,
     src: [i32; MAXF],
     dst: [i32; MAXF],
     size: [u64; MAXF],
+    rel: [[u8; RELB]; MAXF],
+    rel_len: [usize; MAXF],
+    hash: [[u8; 32]; MAXF],
     ok_path: [u8; PATHB],
     tmp_dir: [u8; PATHB],
     fin_dir: [u8; PATHB],
+    /// rendered "VERSION\nfp ..\nn ..\n"; the file lines + "end\n" are appended at publish
     ok: [u8; 8192],
     ok_len: usize,
 }
-static mut PLAN: Plan = Plan { n: 0, src: [-1; MAXF], dst: [-1; MAXF], size: [0; MAXF], ok_path: [0; PATHB], tmp_dir: [0; PATHB], fin_dir: [0; PATHB], ok: [0; 8192], ok_len: 0 };
+static mut PLAN: Plan = Plan {
+    n: 0,
+    src: [-1; MAXF],
+    dst: [-1; MAXF],
+    size: [0; MAXF],
+    rel: [[0; RELB]; MAXF],
+    rel_len: [0; MAXF],
+    hash: [[0; 32]; MAXF],
+    ok_path: [0; PATHB],
+    tmp_dir: [0; PATHB],
+    fin_dir: [0; PATHB],
+    ok: [0; 8192],
+    ok_len: 0,
+};
+/// per store thread copy buffers (.bss: never zapped, no heap)
+static mut SBUFS: [[u8; SBUF]; STORE_THREADS] = [[0; SBUF]; STORE_THREADS];
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::SeqCst};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
@@ -482,8 +564,8 @@ pub fn plan_addr() -> usize {
 }
 
 /// Prepares the store of the outputs in `out` under fingerprint `fp`: removes every
-/// other entry, creates <fp>.tmp.<pid>/ with the destination files, opens the sources,
-/// renders OK. Call after every output file is written and closed, before threads run.
+/// other entry, creates <fp>.tmp.<pid>/ with the destination files, opens the sources.
+/// Call after every output file is written and closed, before any store thread runs.
 pub fn plan_store(fp: &str, out: &Path) -> bool {
     use std::os::unix::io::IntoRawFd;
     let r = (|| {
@@ -500,22 +582,17 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
             let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
         }
         let v = listing(out)?;
-        if v.len() > MAXF {
+        if v.is_empty() || v.len() > MAXF || v.iter().any(|(r, _)| !valid_rel(r) || r.len() > RELB) {
             return None;
         }
-        let mut s = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
-        for (rel, sz) in &v {
-            s.push_str(&format!("{sz}\t{rel}\n"));
-        }
-        s.push_str("end\n");
-        parse_ok(&s, fp)?; // never publish what replay would reject
+        let head = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
         let tmp = base.join(format!("{fp}.tmp.{}", std::process::id()));
         std::fs::create_dir(&tmp).ok()?;
         std::fs::create_dir(tmp.join("user_daily")).ok()?;
         std::fs::create_dir(tmp.join("campaign_daily")).ok()?;
         // SAFETY: single-threaded here (no store thread exists yet)
         let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
-        if s.len() > plan.ok.len() {
+        if head.len() + v.len() * (20 + 1 + 32 + 1 + RELB + 1) + 4 > plan.ok.len() {
             return None;
         }
         for (i, (rel, sz)) in v.iter().enumerate() {
@@ -527,13 +604,15 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
             plan.src[i] = src.into_raw_fd();
             plan.dst[i] = dst.into_raw_fd();
             plan.size[i] = *sz;
+            plan.rel[i][..rel.len()].copy_from_slice(rel.as_bytes());
+            plan.rel_len[i] = rel.len();
             plan.n = i + 1;
         }
         cpath(&mut plan.ok_path, &tmp.join("OK"))?;
         cpath(&mut plan.tmp_dir, &tmp)?;
         cpath(&mut plan.fin_dir, &base.join(fp))?;
-        plan.ok[..s.len()].copy_from_slice(s.as_bytes());
-        plan.ok_len = s.len();
+        plan.ok[..head.len()].copy_from_slice(head.as_bytes());
+        plan.ok_len = head.len();
         Some(())
     })();
     if r.is_some() {
@@ -545,58 +624,102 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
     }
 }
 
-/// Store worker: syscalls only (no heap, no stdio). Safe to run during the zap.
-pub fn store_work() {
-    if STATE.load(SeqCst) != 1 {
+/// Copies planned file i through `buf` (pread / hash / pwrite). true = exact length.
+fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF], hash: &mut [u8; 32]) -> bool {
+    let (src, dst, size) = (plan.src[i], plan.dst[i], plan.size[i]);
+    let mut h = FH::new();
+    let mut done: u64 = 0;
+    while done < size {
+        if FAIL.load(SeqCst) {
+            return false;
+        }
+        let k = ((size - done) as usize).min(SBUF);
+        let r = unsafe { libc::pread(src, buf.as_mut_ptr() as *mut libc::c_void, k, done as i64) };
+        if r <= 0 {
+            return false;
+        }
+        let r = r as usize;
+        h.update(&buf[..r]);
+        let mut w = 0usize;
+        while w < r {
+            let x = unsafe { libc::pwrite(dst, buf.as_ptr().add(w) as *const libc::c_void, r - w, (done + w as u64) as i64) };
+            if x <= 0 {
+                return false;
+            }
+            w += x as usize;
+        }
+        done += r as u64;
+    }
+    // the source must not have grown, the copy must have exactly `size` bytes
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let mut ss: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dst, &mut st) } != 0 || unsafe { libc::fstat(src, &mut ss) } != 0 {
+        return false;
+    }
+    if st.st_size as u64 != size || ss.st_size as u64 != size {
+        return false;
+    }
+    *hash = h.hex();
+    true
+}
+
+/// Appends b to plan.ok (no heap). false = no room.
+fn ok_push(plan: &mut Plan, b: &[u8]) -> bool {
+    if plan.ok_len + b.len() > plan.ok.len() {
+        return false;
+    }
+    plan.ok[plan.ok_len..plan.ok_len + b.len()].copy_from_slice(b);
+    plan.ok_len += b.len();
+    true
+}
+
+fn ok_push_u64(plan: &mut Plan, mut x: u64) -> bool {
+    let mut d = [0u8; 20];
+    let mut k = 20;
+    loop {
+        k -= 1;
+        d[k] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    ok_push(plan, &d[k..])
+}
+
+/// Store worker `t` (< STORE_THREADS): syscalls only (no heap, no stdio), safe to run
+/// during the zap. The thread finishing the last file renders OK and publishes.
+pub fn store_work(t: usize) {
+    if STATE.load(SeqCst) != 1 || t >= STORE_THREADS {
         return;
     }
-    // SAFETY: the plan is immutable once STATE == 1
-    let plan = unsafe { &*std::ptr::addr_of!(PLAN) };
+    // SAFETY: plan fields read here are immutable once STATE == 1, except hash[i]
+    // (written only by the thread that took index i) and ok/ok_len (only by the
+    // single publishing thread, after every hash is written: DONE is SeqCst).
+    let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
+    let buf = unsafe { &mut (*std::ptr::addr_of_mut!(SBUFS))[t] };
     loop {
         let i = NEXT.fetch_add(1, SeqCst);
         if i >= plan.n {
             return;
         }
-        let (src, dst, size) = (plan.src[i], plan.dst[i], plan.size[i]);
-        let mut done: u64 = 0;
-        let mut kernel = true;
-        while done < size && !FAIL.load(SeqCst) {
-            let want = (size - done).min(1 << 30) as usize;
-            let r = if kernel {
-                let mut oi = done as i64;
-                let mut oo = done as i64;
-                let r = unsafe { libc::copy_file_range(src, &mut oi, dst, &mut oo, want, 0) };
-                if r <= 0 {
-                    kernel = false;
-                    continue;
-                }
-                r
-            } else {
-                // sendfile file -> file; the output offset follows the fd position
-                if unsafe { libc::lseek(dst, done as i64, libc::SEEK_SET) } != done as i64 {
-                    -1
-                } else {
-                    let mut off = done as i64;
-                    unsafe { libc::sendfile(dst, src, &mut off, want) }
-                }
-            };
-            if r <= 0 {
-                FAIL.store(true, SeqCst);
-                break;
-            }
-            done += r as u64;
-        }
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if done != size || unsafe { libc::fstat(dst, &mut st) } != 0 || st.st_size as u64 != size {
+        let mut hx = [0u8; 32];
+        if !store_one(plan, i, buf, &mut hx) {
             FAIL.store(true, SeqCst);
         }
+        plan.hash[i] = hx;
         unsafe {
-            libc::close(src);
-            libc::close(dst);
+            libc::close(plan.src[i]);
+            libc::close(plan.dst[i]);
         }
         if DONE.fetch_add(1, SeqCst) + 1 == plan.n {
-            // last file: publish (OK last, then the atomic rename)
-            let ok = !FAIL.load(SeqCst) && unsafe {
+            let mut ok = !FAIL.load(SeqCst);
+            for j in 0..plan.n {
+                let (rel, rl, hj, sz) = (plan.rel[j], plan.rel_len[j], plan.hash[j], plan.size[j]);
+                ok = ok && ok_push_u64(plan, sz) && ok_push(plan, b"\t") && ok_push(plan, &hj) && ok_push(plan, b"\t") && ok_push(plan, &rel[..rl]) && ok_push(plan, b"\n");
+            }
+            ok = ok && ok_push(plan, b"end\n");
+            let ok = ok && unsafe {
                 let fd = libc::open(plan.ok_path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o644);
                 fd >= 0 && {
                     let w = libc::write(fd, plan.ok.as_ptr() as *const libc::c_void, plan.ok_len);
@@ -609,10 +732,10 @@ pub fn store_work() {
     }
 }
 
-/// Number of planned files (store threads worth spawning).
-pub fn store_files() -> usize {
+/// Store threads worth spawning (0 = nothing planned).
+pub fn store_threads() -> usize {
     if STATE.load(SeqCst) == 1 {
-        unsafe { (*std::ptr::addr_of!(PLAN)).n }
+        unsafe { (*std::ptr::addr_of!(PLAN)).n }.min(STORE_THREADS)
     } else {
         0
     }
@@ -643,7 +766,69 @@ pub fn mono_ns() -> u64 {
 /// The store for runs without the zap: plan + copy synchronously.
 pub fn store_sync(fp: &str, out: &Path) {
     if plan_store(fp, out) {
-        store_work();
+        store_work(0);
         log(if STATE.load(SeqCst) == 2 { "stored" } else { "store failed" });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fh_chunking_invariant_and_sensitive() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        for n in [0usize, 1, 31, 32, 33, 100, 4999, 5000] {
+            let mut a = FH::new();
+            a.update(&data[..n]);
+            for step in [1usize, 3, 7, 32, 64, 1000] {
+                let mut b = FH::new();
+                for c in data[..n].chunks(step) {
+                    b.update(c);
+                }
+                assert_eq!(a.hex(), b.hex(), "n={n} step={step}");
+            }
+            if n > 0 {
+                for i in [0, n / 2, n - 1] {
+                    let mut d = data[..n].to_vec();
+                    d[i] ^= 1;
+                    let mut c = FH::new();
+                    c.update(&d);
+                    assert_ne!(a.hex(), c.hex(), "flip n={n} i={i}");
+                }
+                let mut c = FH::new();
+                c.update(&data[..n - 1]);
+                assert_ne!(a.hex(), c.hex(), "shorter n={n}");
+            }
+        }
+        // trailing zero bytes change the hash
+        let mut a = FH::new();
+        a.update(b"abc");
+        let mut b = FH::new();
+        b.update(b"abc\0");
+        assert_ne!(a.hex(), b.hex());
+    }
+    #[test]
+    fn ok_roundtrip_and_rejects() {
+        let h = "0123456789abcdef0123456789abcdef";
+        let good = format!("{VERSION}\nfp X\nn 2\n100\t{h}\tcampaign_daily/part-0.parquet\n200\t{h}\tuser_daily/part-3.parquet\nend\n");
+        let v = parse_ok(&good, "X").unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].1, 200);
+        assert!(parse_ok(&good, "Y").is_none());
+        for bad in [
+            good.replace("n 2", "n 3"),
+            good.replace("n 2", "n 1"),
+            good.replace("end\n", "end"),
+            good.replace("end\n", "end\nx"),
+            good.replace("user_daily/part-3", "user_daily/../part-3"),
+            good.replace("user_daily/part-3", "user_daily/part-x"),
+            good.replace("campaign_daily/part-0.parquet", "user_daily/part-0.parquet"),
+            good.replace("200\t", "-1\t"),
+            good.replace(&format!("200\t{h}"), &format!("200\t{}", &h[..31])),
+            good.replace(&format!("200\t{h}"), &format!("200\t{}", h.to_uppercase())),
+            good.replace("fastcache v2", "fastcache v1"),
+        ] {
+            assert!(parse_ok(&bad, "X").is_none(), "{bad}");
+        }
     }
 }
