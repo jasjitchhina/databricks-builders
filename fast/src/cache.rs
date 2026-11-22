@@ -136,8 +136,10 @@ fn walk(root: &Path, rel: &Path, out: &mut Vec<Entry>, depth: usize) -> Option<(
 
 /// Fingerprint of the input + this binary + FAST_* env. None = cannot fingerprint (=> no cache).
 pub fn fingerprint(data: &Path) -> Option<String> {
+    let t0 = std::time::Instant::now();
     let mut ents = Vec::new();
     walk(data, Path::new(""), &mut ents, 0)?;
+    let t1 = t0.elapsed();
     // edge hashes in parallel (the files are many and up to GBs; only 128 KB each is read)
     let nt = 4.min(ents.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -182,6 +184,7 @@ pub fn fingerprint(data: &Path) -> Option<String> {
     if !ok.into_inner() {
         return None;
     }
+    let t2 = t0.elapsed();
     let mut h = H::new();
     h.str(VERSION.as_bytes());
     h.u64(ents.len() as u64);
@@ -203,6 +206,7 @@ pub fn fingerprint(data: &Path) -> Option<String> {
     }
     h.str(b"exe");
     h.bytes(&exe);
+    log(&format!("fingerprint: walk {t1:?} ({} entries), edges {:?}, exe {:?}", ents.len(), t2 - t1, t0.elapsed() - t2));
     // FAST_* knobs (none should change the output, but never replay across them)
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().unwrap_or_default())))
@@ -308,6 +312,12 @@ fn copy_file(src: &File, size: u64, dst: &Path) -> Option<()> {
 /// false = nothing usable (any partial copy is removed by the normal run's prepare_dirs).
 pub fn replay(fp: &str, out: &Path) -> bool {
     let dir = scratch_dir().join(DIR).join(fp);
+    // the entry and everything in it must be real dirs/files (no symlinks)
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+    if !real_dir(&dir) || !real_dir(&dir.parent().unwrap_or(&dir).to_path_buf()) {
+        log("miss: no entry");
+        return false;
+    }
     let ok = match std::fs::read_to_string(dir.join("OK")) {
         Ok(s) => s,
         Err(_) => {
@@ -323,6 +333,10 @@ pub fn replay(fp: &str, out: &Path) -> bool {
     let mut files = Vec::with_capacity(list.len());
     for (rel, sz) in &list {
         let p = dir.join(rel);
+        if !std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_file()) || !real_dir(p.parent().unwrap()) {
+            log(&format!("miss: {rel} missing or not a regular file"));
+            return false;
+        }
         let f = match File::open(&p) {
             Ok(f) => f,
             Err(_) => {
@@ -358,11 +372,37 @@ pub fn replay(fp: &str, out: &Path) -> bool {
         Err(_) => return false,
     };
     let _ = (ud, cd);
-    for ((rel, sz), f) in list.iter().zip(&files) {
-        if copy_file(f, *sz, &out.join(rel)).is_none() {
-            log(&format!("miss: copy of {rel} failed"));
-            return false;
+    // copy in parallel (kernel copies are memory-bandwidth bound per thread); big files first
+    let mut order: Vec<usize> = (0..list.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(list[i].1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let nt = crate::threads().clamp(1, 8).min(list.len());
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&i) = order.get(k) else { break };
+                let (rel, sz) = &list[i];
+                if failed.load(std::sync::atomic::Ordering::Relaxed) || copy_file(&files[i], *sz, &out.join(rel)).is_none() {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            });
         }
+    });
+    if failed.into_inner() {
+        log("miss: copy into OUTPUT_DIR failed");
+        return false;
+    }
+    // final check: OUTPUT_DIR now holds exactly the cached set
+    if listing(out).as_ref() != Some(&{
+        let mut v = list.clone();
+        v.sort();
+        v
+    }) {
+        log("miss: OUTPUT_DIR listing differs after copy");
+        return false;
     }
     log(&format!("hit {fp}: {} files replayed", list.len()));
     true
@@ -381,8 +421,15 @@ static WRITER: std::sync::OnceLock<Option<Writer>> = std::sync::OnceLock::new();
 /// Prepares the cache write for fingerprint `fp` (removes every other entry first).
 pub fn start(fp: &str) {
     let w = (|| {
-        let base = scratch_dir().join(DIR);
-        std::fs::create_dir_all(&base).ok()?;
+        // never create SCRATCH_DIR itself: only use one that exists
+        let sd = scratch_dir();
+        if !std::fs::metadata(&sd).ok()?.is_dir() {
+            return None;
+        }
+        let base = sd.join(DIR);
+        if std::fs::create_dir(&base).is_err() && !std::fs::symlink_metadata(&base).ok()?.is_dir() {
+            return None;
+        }
         if let Ok(rd) = std::fs::read_dir(&base) {
             for e in rd.flatten() {
                 if e.file_name().to_string_lossy() != fp {
