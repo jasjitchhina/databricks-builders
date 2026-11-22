@@ -25,7 +25,7 @@ helper() {  # helper DIR 'sh cmds on /w' : root shell on a dir (cached files bel
 nuke() { for d in "$@"; do [ -e "$d" ] || continue; rm -rf "$d" 2>/dev/null || { helper "$(dirname "$d")" "rm -rf '/w/$(basename "$d")'"; }; done; }
 entries() { ls -1 "$1/.fastcache" 2>/dev/null | grep -v '\.tmp\.' | sort | tr '\n' ' '; }
 
-# go NAME DATA SCRATCH EXPECT(hit|miss|any) ANSWER [extra TARGET_ENV] [RT_SCRATCH_MODE]
+# go NAME DATA SCRATCH EXPECT(hit|miss|any|nohit = miss or silent) ANSWER [extra TARGET_ENV] [RT_SCRATCH_MODE]
 # runs once into a fresh output dir pre-seeded with a stale junk part file (the cache must clear it like a full run)
 go() {
   local name=$1 data=$2 scr=$3 want=$4 ans=$5 xenv=${6:-} mode=${7:-rw} out=$W/o-$1 log=$W/log-$1 got
@@ -41,7 +41,7 @@ go() {
     echo "FAIL cache/$name: output DIFFERS from reference ($got)"; sed 's/^/     /' "$W/cmp-$name" | head -12; FAILS+=("$name"); return 1
   fi
   case "$want:$got" in
-    hit:"cache: hit"*|miss:"cache: miss"*|any:*) ;;
+    hit:"cache: hit"*|miss:"cache: miss"*|any:*|nohit:|nohit:"cache: miss"*) ;;
     *) echo "FAIL cache/$name: expected $want, log says '${got:-<no cache line>}'"; FAILS+=("$name"); return 1 ;;
   esac
   NOK=$((NOK+1)); echo "ok   cache/$name ($want: ${got:-<no cache line>}; $(grep -m1 '^user_daily' "$W/cmp-$name" | cut -d';' -f1))"
@@ -147,18 +147,18 @@ else echo "skip cache/t7-full: native target (needs a tmpfs volume)"; fi
 # ---- T8 two fingerprints present
 S1=$W/s8a; S2=$W/s8b; nuke "$S1" "$S2"
 go t8-popA "$A" "$S1" miss "$AANS"; go t8-popB "$B" "$S2" miss "$BANS"
-cp -r "$S1/.fastcache/." "$S2/.fastcache/" && chmod -R a+rwX "$S2" && [ "$(entries "$S2" | wc -w)" = 2 ] || { echo "FAIL cache/t8-setup: could not make 2 entries"; FAILS+=(t8-setup); }
+helper "$W" "cp -r $(basename "$S1")/.fastcache/. $(basename "$S2")/.fastcache/" && [ "$(entries "$S2" | wc -w)" = 2 ] || { echo "FAIL cache/t8-setup: could not make 2 entries"; FAILS+=(t8-setup); }
 go t8-A-with-2 "$A" "$S2" hit "$AANS"
-cp -r "$S1/.fastcache/." "$S2/.fastcache/" 2>/dev/null; chmod -R a+rwX "$S2" 2>/dev/null
+helper "$W" "cp -r $(basename "$S1")/.fastcache/. $(basename "$S2")/.fastcache/"
 go t8-B-with-2 "$B" "$S2" hit "$BANS"
 [ "$(entries "$S2" | wc -w)" -le 1 ] || echo "warn cache/t8: $(entries "$S2" | wc -w) entries left after a hit (stores prune, hits need not)"
 
 # ---- T9 FAST_NO_CACHE=1 disables read and write
 S=$W/s9; nuke "$S"; go t9-populate "$A" "$S" miss "$AANS"
 BEFORE=$(find "$S" -printf '%P %s %T@\n' | sort | md5sum)
-go t9-disabled-A "$A" "$S" miss "$AANS" FAST_NO_CACHE=1
+go t9-disabled-A "$A" "$S" nohit "$AANS" FAST_NO_CACHE=1
 case "$("$H/cacheline" "$W/log-t9-disabled-A")" in "cache: hit"*) echo "FAIL cache/t9: FAST_NO_CACHE=1 run logged a hit"; FAILS+=(t9-log);; esac
-go t9-disabled-B "$B" "$S" miss "$BANS" FAST_NO_CACHE=1
+go t9-disabled-B "$B" "$S" nohit "$BANS" FAST_NO_CACHE=1
 [ "$(find "$S" -printf '%P %s %T@\n' | sort | md5sum)" = "$BEFORE" ] && echo "ok   cache/t9-nowrite (scratch untouched)" || { echo "FAIL cache/t9-nowrite: FAST_NO_CACHE=1 modified scratch"; FAILS+=(t9-nowrite); }
 
 nuke "$W"/s* "$W"/o-* "$W"/ref-* "$D"
