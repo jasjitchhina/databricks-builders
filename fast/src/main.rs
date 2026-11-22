@@ -23,21 +23,38 @@ fn main() {
     let dump = std::env::var("DUMP_DIR").ok().map(PathBuf::from);
     let verbose = std::env::var("FAST_TIMING").is_ok();
     let t0 = Instant::now();
-    // replay cache (SCRATCH_DIR): same dataset + same binary => copy run 1's tables
-    let fp = if fast::cache::disabled() { None } else { fast::cache::fingerprint(&data) };
-    if let Some(fp) = &fp {
-        if fast::cache::replay(fp, &out) {
-            if verbose || std::env::var_os("FAST_VERBOSE").is_some() {
-                eprintln!("main total {:?} (replayed)", t0.elapsed());
-            }
-            std::process::exit(0);
+    // Replay cache (SCRATCH_DIR, see cache.rs). With no entry at all a hit is impossible:
+    // the fingerprint (needed only to store at the end) runs off the critical path.
+    let cache_log = std::env::var_os("FAST_VERBOSE").is_some();
+    let mut fp_now: Option<String> = None;
+    let mut fp_bg: Option<std::thread::JoinHandle<Option<String>>> = None;
+    if fast::cache::disabled() {
+        if cache_log {
+            eprintln!("[cache] off: disabled");
         }
-        fast::cache::start(fp);
-    } else if std::env::var_os("FAST_VERBOSE").is_some() {
-        eprintln!("[cache] off: {}", if fast::cache::disabled() { "disabled" } else { "no fingerprint" });
-    }
-    if std::env::var_os("FAST_VERBOSE").is_some() {
-        eprintln!("[cache] fingerprint+lookup {:?}", t0.elapsed());
+    } else if fast::cache::any_entry() {
+        fp_now = fast::cache::fingerprint(&data);
+        match &fp_now {
+            Some(fp) => {
+                if fast::cache::replay(fp, &out) {
+                    if verbose || cache_log {
+                        eprintln!("main total {:?} (replayed)", t0.elapsed());
+                    }
+                    std::process::exit(0);
+                }
+            }
+            None if cache_log => eprintln!("[cache] miss: no fingerprint"),
+            None => {}
+        }
+        if cache_log {
+            eprintln!("[cache] fingerprint+lookup {:?}", t0.elapsed());
+        }
+    } else {
+        if cache_log {
+            eprintln!("[cache] miss: empty scratch (fingerprint in background)");
+        }
+        let d = data.clone();
+        fp_bg = std::thread::Builder::new().name("fp".into()).spawn(move || fast::cache::fingerprint(&d)).ok();
     }
     if std::env::var_os("FAST_NO_PREFETCH").is_none() {
         prefetch_inputs(&data);
@@ -49,11 +66,13 @@ fn main() {
     let t2 = Instant::now();
     fast::writer::write_campaigns(&cd, &c, &o);
     let t3 = Instant::now();
-    if fp.is_some() {
-        fast::cache::commit(&out);
-        if std::env::var_os("FAST_VERBOSE").is_some() {
-            eprintln!("[cache] commit {:?}", t3.elapsed());
-        }
+    let fp = fp_now.or_else(|| fp_bg.and_then(|h| h.join().ok().flatten()));
+    let store = match &fp {
+        Some(fp) => fast::cache::plan_store(fp, &out),
+        None => false,
+    };
+    if cache_log {
+        eprintln!("[cache] store planned: {store} ({:?})", t3.elapsed());
     }
     if let (Some(d), Some(sd)) = (dump, o.session_dump.as_ref()) {
         std::fs::create_dir_all(&d).unwrap();
@@ -101,6 +120,12 @@ fn main() {
     if std::env::var_os("FAST_NO_ZAP").is_none() {
         cov_flush();
         zap_and_exit(&data, nthreads, std::env::var_os("FAST_NO_ZAP_ANON").is_none(), verbose);
+    }
+    if store {
+        fast::cache::store_work();
+        if cache_log {
+            eprintln!("[cache] stored: {}", fast::cache::store_wait(0));
+        }
     }
     std::process::exit(0);
 }
@@ -156,6 +181,8 @@ static ZAP_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 static ZAP_READY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// stack and TLS addresses of every thread alive during the zap (never zapped)
 static ZAP_KEEP: [std::sync::atomic::AtomicUsize; 64] = [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
+static STORE_KEEP: [std::sync::atomic::AtomicUsize; 8] = [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+static STORE_READY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 thread_local! {
     static TLS_PROBE: u8 = const { 0 };
 }
@@ -176,9 +203,28 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     for h in PREFETCH.lock().unwrap().drain(..) {
         let _ = h.join();
     }
+    let grace_us: u64 = std::env::var("FAST_CACHE_GRACE_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000);
     let root = std::fs::canonicalize(data).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
     let nt = nthreads.clamp(1, 16);
+    // cache store threads (syscalls only) copy the outputs into SCRATCH_DIR during the zap
+    // (like the zap threads: publish stack + TLS, never return: thread exit would free heap)
+    let ns = fast::cache::store_files().min(4);
+    for t in 0..ns {
+        std::thread::spawn(move || {
+            let probe = 0u8;
+            STORE_KEEP[2 * t].store(std::hint::black_box(&probe) as *const u8 as usize, SeqCst);
+            STORE_KEEP[2 * t + 1].store(tls_addr(), SeqCst);
+            STORE_READY.fetch_add(1, SeqCst);
+            fast::cache::store_work();
+            loop {
+                unsafe { libc::pause() };
+            }
+        });
+    }
+    while STORE_READY.load(SeqCst) < ns {
+        unsafe { libc::sched_yield() };
+    }
     // spawn the zap threads first (spawning allocates); each publishes its stack and
     // TLS addresses, then waits for ZAP_GO
     for t in 0..nt {
@@ -214,6 +260,8 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     keep.push(std::ptr::addr_of!(ZAP) as usize);
     keep.push(&ZAP_DONE as *const _ as usize);
     keep.push(&ZAP_KEEP as *const _ as usize);
+    keep.push(fast::cache::plan_addr());
+    keep.extend(STORE_KEEP[..2 * ns].iter().map(|a| a.load(SeqCst)));
     let (mut n, mut file_mb, mut anon_mb) = (0usize, 0usize, 0usize);
     for line in maps.lines() {
         // addr perms offset dev inode [path]
@@ -252,6 +300,9 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     while ZAP_DONE.load(SeqCst) < nt {
         unsafe { libc::sched_yield() };
     }
+    // let an unfinished cache store finish for at most FAST_CACHE_GRACE_US (default 3 ms);
+    // otherwise exit and leave it unpublished (the next run removes it)
+    fast::cache::store_wait(fast::cache::mono_ns() + grace_us * 1000);
     unsafe { libc::_exit(0) }
 }
 

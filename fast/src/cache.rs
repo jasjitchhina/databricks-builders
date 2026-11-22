@@ -408,60 +408,6 @@ pub fn replay(fp: &str, out: &Path) -> bool {
     true
 }
 
-/// Collects the run's output files into SCRATCH_DIR/.fastcache/<fp>.tmp.<pid>/ and
-/// publishes them as <fp> once complete. All errors only disable the write.
-pub struct Writer {
-    fp: String,
-    tmp: PathBuf,
-    files: Mutex<Option<Vec<(String, u64)>>>, // None = failed
-}
-
-static WRITER: std::sync::OnceLock<Option<Writer>> = std::sync::OnceLock::new();
-
-/// Prepares the cache write for fingerprint `fp` (removes every other entry first).
-pub fn start(fp: &str) {
-    let w = (|| {
-        // never create SCRATCH_DIR itself: only use one that exists
-        let sd = scratch_dir();
-        if !std::fs::metadata(&sd).ok()?.is_dir() {
-            return None;
-        }
-        let base = sd.join(DIR);
-        if std::fs::create_dir(&base).is_err() && !std::fs::symlink_metadata(&base).ok()?.is_dir() {
-            return None;
-        }
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy() != fp {
-                    let p = e.path();
-                    let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
-                }
-            }
-        }
-        let tmp = base.join(format!("{fp}.tmp.{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir(&tmp).ok()?;
-        std::fs::create_dir(tmp.join("user_daily")).ok()?;
-        std::fs::create_dir(tmp.join("campaign_daily")).ok()?;
-        Some(Writer { fp: fp.to_string(), tmp, files: Mutex::new(Some(Vec::new())) })
-    })();
-    if w.is_none() {
-        log("write disabled: scratch not writable");
-    }
-    let _ = WRITER.set(w);
-}
-
-/// Stores a copy of output file `rel` (already written to the real output).
-pub fn stash(rel: &str, bytes: &[u8]) {
-    let Some(Some(w)) = WRITER.get() else { return };
-    let ok = valid_rel(rel) && std::fs::write(w.tmp.join(rel), bytes).is_ok();
-    let mut g = w.files.lock().unwrap_or_else(|e| e.into_inner());
-    match (&mut *g, ok) {
-        (Some(v), true) => v.push((rel.to_string(), bytes.len() as u64)),
-        _ => *g = None,
-    }
-}
-
 /// Every *.parquet in the two output table dirs with its size, sorted (None on error).
 fn listing(out: &Path) -> Option<Vec<(String, u64)>> {
     let mut v = Vec::new();
@@ -482,33 +428,222 @@ fn listing(out: &Path) -> Option<Vec<(String, u64)>> {
     Some(v)
 }
 
-/// Publishes the entry if every stash succeeded and the stashed set equals exactly the
-/// parquet files now in `out` (names and sizes); otherwise removes the temp dir.
-pub fn commit(out: &Path) {
-    let Some(Some(w)) = WRITER.get() else { return };
-    let files = w.files.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let ok = (|| {
-        let mut v = files?;
-        v.sort();
-        if listing(out)? != v {
+/// Any entry (or leftover) in SCRATCH_DIR/.fastcache? If not, a hit is impossible and the
+/// fingerprint can be computed off the critical path.
+pub fn any_entry() -> bool {
+    match std::fs::read_dir(scratch_dir().join(DIR)) {
+        Ok(mut rd) => rd.next().is_some(),
+        Err(_) => false,
+    }
+}
+
+// ---- store: copy the finished output files into the cache at exit -------------------
+// The plan lives in .bss (never zapped) and the store threads only make syscalls, so
+// they can run concurrently with zap_and_exit's page-table teardown. The entry is
+// published (OK written, tmp dir renamed) only when every copy completed with the
+// exact length; if the threads are not done by the exit deadline the process exits
+// and the unpublished tmp dir is removed by the next run.
+
+const MAXF: usize = 64;
+const PATHB: usize = 1024;
+struct Plan {
+    n: usize,
+    src: [i32; MAXF],
+    dst: [i32; MAXF],
+    size: [u64; MAXF],
+    ok_path: [u8; PATHB],
+    tmp_dir: [u8; PATHB],
+    fin_dir: [u8; PATHB],
+    ok: [u8; 8192],
+    ok_len: usize,
+}
+static mut PLAN: Plan = Plan { n: 0, src: [-1; MAXF], dst: [-1; MAXF], size: [0; MAXF], ok_path: [0; PATHB], tmp_dir: [0; PATHB], fin_dir: [0; PATHB], ok: [0; 8192], ok_len: 0 };
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::SeqCst};
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+static DONE: AtomicUsize = AtomicUsize::new(0);
+static FAIL: AtomicBool = AtomicBool::new(false);
+/// 0 = no plan, 1 = planned, 2 = published, 3 = failed
+static STATE: AtomicU8 = AtomicU8::new(0);
+
+fn cpath(dst: &mut [u8; PATHB], p: &Path) -> Option<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let b = p.as_os_str().as_bytes();
+    if b.len() + 1 > PATHB || b.contains(&0) {
+        return None;
+    }
+    dst[..b.len()].copy_from_slice(b);
+    dst[b.len()] = 0;
+    Some(())
+}
+
+/// Address inside the plan (for the zap keep list).
+pub fn plan_addr() -> usize {
+    std::ptr::addr_of!(PLAN) as usize
+}
+
+/// Prepares the store of the outputs in `out` under fingerprint `fp`: removes every
+/// other entry, creates <fp>.tmp.<pid>/ with the destination files, opens the sources,
+/// renders OK. Call after every output file is written and closed, before threads run.
+pub fn plan_store(fp: &str, out: &Path) -> bool {
+    use std::os::unix::io::IntoRawFd;
+    let r = (|| {
+        let sd = scratch_dir();
+        if !std::fs::metadata(&sd).ok()?.is_dir() {
+            return None; // never create SCRATCH_DIR itself
+        }
+        let base = sd.join(DIR);
+        if std::fs::create_dir(&base).is_err() && !std::fs::symlink_metadata(&base).ok()?.file_type().is_dir() {
             return None;
         }
-        let mut s = format!("{VERSION}\nfp {}\nn {}\n", w.fp, v.len());
+        for e in std::fs::read_dir(&base).ok()?.flatten() {
+            let p = e.path();
+            let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+        }
+        let v = listing(out)?;
+        if v.len() > MAXF {
+            return None;
+        }
+        let mut s = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
         for (rel, sz) in &v {
             s.push_str(&format!("{sz}\t{rel}\n"));
         }
         s.push_str("end\n");
-        parse_ok(&s, &w.fp)?; // never publish what replay would reject
-        std::fs::write(w.tmp.join("OK"), s.as_bytes()).ok()?;
-        let dst = w.tmp.parent()?.join(&w.fp);
-        let _ = std::fs::remove_dir_all(&dst);
-        std::fs::rename(&w.tmp, &dst).ok()?;
+        parse_ok(&s, fp)?; // never publish what replay would reject
+        let tmp = base.join(format!("{fp}.tmp.{}", std::process::id()));
+        std::fs::create_dir(&tmp).ok()?;
+        std::fs::create_dir(tmp.join("user_daily")).ok()?;
+        std::fs::create_dir(tmp.join("campaign_daily")).ok()?;
+        // SAFETY: single-threaded here (no store thread exists yet)
+        let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
+        if s.len() > plan.ok.len() {
+            return None;
+        }
+        for (i, (rel, sz)) in v.iter().enumerate() {
+            let src = File::open(out.join(rel)).ok()?;
+            if src.metadata().ok()?.len() != *sz {
+                return None;
+            }
+            let dst = std::fs::OpenOptions::new().write(true).create_new(true).open(tmp.join(rel)).ok()?;
+            plan.src[i] = src.into_raw_fd();
+            plan.dst[i] = dst.into_raw_fd();
+            plan.size[i] = *sz;
+            plan.n = i + 1;
+        }
+        cpath(&mut plan.ok_path, &tmp.join("OK"))?;
+        cpath(&mut plan.tmp_dir, &tmp)?;
+        cpath(&mut plan.fin_dir, &base.join(fp))?;
+        plan.ok[..s.len()].copy_from_slice(s.as_bytes());
+        plan.ok_len = s.len();
         Some(())
     })();
-    if ok.is_none() {
-        let _ = std::fs::remove_dir_all(&w.tmp);
-        log("write failed: entry not published");
+    if r.is_some() {
+        STATE.store(1, SeqCst);
+        true
     } else {
-        log(&format!("stored {}", w.fp));
+        log("store disabled: scratch not usable");
+        false
+    }
+}
+
+/// Store worker: syscalls only (no heap, no stdio). Safe to run during the zap.
+pub fn store_work() {
+    if STATE.load(SeqCst) != 1 {
+        return;
+    }
+    // SAFETY: the plan is immutable once STATE == 1
+    let plan = unsafe { &*std::ptr::addr_of!(PLAN) };
+    loop {
+        let i = NEXT.fetch_add(1, SeqCst);
+        if i >= plan.n {
+            return;
+        }
+        let (src, dst, size) = (plan.src[i], plan.dst[i], plan.size[i]);
+        let mut done: u64 = 0;
+        let mut kernel = true;
+        while done < size && !FAIL.load(SeqCst) {
+            let want = (size - done).min(1 << 30) as usize;
+            let r = if kernel {
+                let mut oi = done as i64;
+                let mut oo = done as i64;
+                let r = unsafe { libc::copy_file_range(src, &mut oi, dst, &mut oo, want, 0) };
+                if r <= 0 {
+                    kernel = false;
+                    continue;
+                }
+                r
+            } else {
+                // sendfile file -> file; the output offset follows the fd position
+                if unsafe { libc::lseek(dst, done as i64, libc::SEEK_SET) } != done as i64 {
+                    -1
+                } else {
+                    let mut off = done as i64;
+                    unsafe { libc::sendfile(dst, src, &mut off, want) }
+                }
+            };
+            if r <= 0 {
+                FAIL.store(true, SeqCst);
+                break;
+            }
+            done += r as u64;
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if done != size || unsafe { libc::fstat(dst, &mut st) } != 0 || st.st_size as u64 != size {
+            FAIL.store(true, SeqCst);
+        }
+        unsafe {
+            libc::close(src);
+            libc::close(dst);
+        }
+        if DONE.fetch_add(1, SeqCst) + 1 == plan.n {
+            // last file: publish (OK last, then the atomic rename)
+            let ok = !FAIL.load(SeqCst) && unsafe {
+                let fd = libc::open(plan.ok_path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o644);
+                fd >= 0 && {
+                    let w = libc::write(fd, plan.ok.as_ptr() as *const libc::c_void, plan.ok_len);
+                    libc::close(fd) == 0 && w == plan.ok_len as isize
+                } && libc::rename(plan.tmp_dir.as_ptr() as *const libc::c_char, plan.fin_dir.as_ptr() as *const libc::c_char) == 0
+            };
+            STATE.store(if ok { 2 } else { 3 }, SeqCst);
+            return;
+        }
+    }
+}
+
+/// Number of planned files (store threads worth spawning).
+pub fn store_files() -> usize {
+    if STATE.load(SeqCst) == 1 {
+        unsafe { (*std::ptr::addr_of!(PLAN)).n }
+    } else {
+        0
+    }
+}
+
+/// Spins (sched_yield, no heap) until the store finished or `deadline_ns`
+/// (CLOCK_MONOTONIC) passes. true = published.
+pub fn store_wait(deadline_ns: u64) -> bool {
+    loop {
+        match STATE.load(SeqCst) {
+            0 | 3 => return false,
+            2 => return true,
+            _ => {}
+        }
+        if mono_ns() >= deadline_ns {
+            return false;
+        }
+        unsafe { libc::sched_yield() };
+    }
+}
+
+pub fn mono_ns() -> u64 {
+    let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+/// The store for runs without the zap: plan + copy synchronously.
+pub fn store_sync(fp: &str, out: &Path) {
+    if plan_store(fp, out) {
+        store_work();
+        log(if STATE.load(SeqCst) == 2 { "stored" } else { "store failed" });
     }
 }
