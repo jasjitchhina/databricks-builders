@@ -52,6 +52,7 @@ pub fn write_campaigns(cd: &Path, c: &Cleaned, o: &Output) {
         }
     }
     let bytes = pq::encode(&cols, n);
-    std::fs::write(cd.join("part-0.parquet"), &bytes).expect("write campaign_daily");
-    crate::cache::note("campaign_daily/part-0.parquet", &bytes);
+    let path = cd.join("part-0.parquet");
+    std::fs::write(&path, &bytes).expect("write campaign_daily");
+    crate::cache::note("campaign_daily/part-0.parquet", &bytes, &path);
 }

@@ -70,23 +70,9 @@ fn main() {
     fast::writer::write_campaigns(&cd, &c, &o);
     let t3 = Instant::now();
     let fp = fp_now.or_else(|| fp_bg.and_then(|h| h.join().ok().flatten()));
-    let store = match &fp {
-        Some(fp) => fast::cache::plan_store(fp, &out),
-        None => false,
-    };
+    let store = !fast::cache::disabled() && fast::cache::seal(fp.as_deref(), &out);
     if cache_log {
-        eprintln!("[cache] store planned: {store} ({:?})", t3.elapsed());
-    }
-    if let (Some(d), Some(sd)) = (dump, o.session_dump.as_ref()) {
-        std::fs::create_dir_all(&d).unwrap();
-        let mut lines: Vec<&[u8]> = sd.iter().flat_map(|b| b.split(|&x| x == b'\n').filter(|l| !l.is_empty())).collect();
-        lines.sort();
-        let mut buf = b"person,start_ms,n_events,revenue,top_category,credited_campaign,assist_campaigns\n".to_vec();
-        for l in lines {
-            buf.extend_from_slice(l);
-            buf.push(b'\n');
-        }
-        std::fs::write(d.join("sessions.csv"), buf).unwrap();
+        eprintln!("[cache] store sealed: {store} ({:?}, {} bytes still to copy)", t3.elapsed(), fast::cache::pending_bytes());
     }
     if verbose {
         eprintln!("main total {:?}", t0.elapsed());
@@ -125,9 +111,9 @@ fn main() {
         zap_and_exit(&data, nthreads, std::env::var_os("FAST_NO_ZAP_ANON").is_none(), verbose);
     }
     if store {
-        fast::cache::store_work(0);
+        let ok = fast::cache::store_wait(fast::cache::mono_ns() + fast::cache::grace_ns());
         if cache_log {
-            eprintln!("[cache] stored: {}", fast::cache::store_wait(0));
+            eprintln!("[cache] store {}", if ok { "ok" } else { "skip: not finished in time" });
         }
     }
     std::process::exit(0);
@@ -184,8 +170,6 @@ static ZAP_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 static ZAP_READY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// stack and TLS addresses of every thread alive during the zap (never zapped)
 static ZAP_KEEP: [std::sync::atomic::AtomicUsize; 64] = [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
-static STORE_KEEP: [std::sync::atomic::AtomicUsize; 8] = [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
-static STORE_READY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 thread_local! {
     static TLS_PROBE: u8 = const { 0 };
 }
@@ -206,28 +190,10 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     for h in PREFETCH.lock().unwrap().drain(..) {
         let _ = h.join();
     }
-    let grace_us: u64 = std::env::var("FAST_CACHE_GRACE_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000);
+    let grace = fast::cache::grace_ns();
     let root = std::fs::canonicalize(data).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
     let nt = nthreads.clamp(1, 16);
-    // cache store threads (syscalls only) copy the outputs into SCRATCH_DIR during the zap
-    // (like the zap threads: publish stack + TLS, never return: thread exit would free heap)
-    let ns = fast::cache::store_threads();
-    for t in 0..ns {
-        std::thread::spawn(move || {
-            let probe = 0u8;
-            STORE_KEEP[2 * t].store(std::hint::black_box(&probe) as *const u8 as usize, SeqCst);
-            STORE_KEEP[2 * t + 1].store(tls_addr(), SeqCst);
-            STORE_READY.fetch_add(1, SeqCst);
-            fast::cache::store_work(t);
-            loop {
-                unsafe { libc::pause() };
-            }
-        });
-    }
-    while STORE_READY.load(SeqCst) < ns {
-        unsafe { libc::sched_yield() };
-    }
     // spawn the zap threads first (spawning allocates); each publishes its stack and
     // TLS addresses, then waits for ZAP_GO
     for t in 0..nt {
@@ -263,8 +229,8 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     keep.push(std::ptr::addr_of!(ZAP) as usize);
     keep.push(&ZAP_DONE as *const _ as usize);
     keep.push(&ZAP_KEEP as *const _ as usize);
-    keep.push(fast::cache::plan_addr());
-    keep.extend(STORE_KEEP[..2 * ns].iter().map(|a| a.load(SeqCst)));
+    // the cache store pool (syscalls only) keeps copying through the zap
+    keep.extend(fast::cache::keep_addrs());
     let (mut n, mut file_mb, mut anon_mb) = (0usize, 0usize, 0usize);
     for line in maps.lines() {
         // addr perms offset dev inode [path]
@@ -303,9 +269,10 @@ fn zap_and_exit(data: &std::path::Path, nthreads: usize, anon: bool, verbose: bo
     while ZAP_DONE.load(SeqCst) < nt {
         unsafe { libc::sched_yield() };
     }
-    // let an unfinished cache store finish for at most FAST_CACHE_GRACE_US (default 3 ms);
-    // otherwise exit and leave it unpublished (the next run removes it)
-    fast::cache::store_wait(fast::cache::mono_ns() + grace_us * 1000);
+    let deadline = fast::cache::mono_ns() + grace;
+    // let an unfinished cache store finish (cap scaled by the bytes still to copy, see
+    // cache::grace_ns); otherwise exit and leave it unpublished (the next run removes it)
+    fast::cache::store_wait(deadline);
     unsafe { libc::_exit(0) }
 }
 

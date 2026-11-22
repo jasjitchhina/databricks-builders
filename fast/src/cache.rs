@@ -497,25 +497,6 @@ fn listing(out: &Path) -> Option<Vec<(String, u64)>> {
     Some(v)
 }
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static NOTED: Mutex<Vec<(String, u64, [u8; 32])>> = Mutex::new(Vec::new());
-
-/// Turns on output hashing for the store (call once, only when a store may follow).
-pub fn enable_notes() {
-    ENABLED.store(true, SeqCst);
-}
-
-/// Records the content hash of output file `rel` = `bytes` (call right after writing it).
-pub fn note(rel: &str, bytes: &[u8]) {
-    if !ENABLED.load(SeqCst) {
-        return;
-    }
-    let mut h = FH::new();
-    h.update(bytes);
-    let hx = h.hex();
-    NOTED.lock().unwrap_or_else(|e| e.into_inner()).push((rel.to_string(), bytes.len() as u64, hx));
-}
-
 /// Any entry (or leftover) in SCRATCH_DIR/.fastcache? If not, a hit is impossible and the
 /// fingerprint can be computed off the critical path.
 pub fn any_entry() -> bool {
@@ -525,48 +506,70 @@ pub fn any_entry() -> bool {
     }
 }
 
-// ---- store: copy the finished output files into the cache at exit -------------------
-// The plan lives in .bss (never zapped) and the store threads only make syscalls, so
-// they can run concurrently with zap_and_exit's page-table teardown. The entry is
-// published (OK written, tmp dir renamed) only when every copy completed with the
-// exact length; if the threads are not done by the exit deadline the process exits
-// and the unpublished tmp dir is removed by the next run.
+// ---- store ------------------------------------------------------------------------
+// Each output file is copied into SCRATCH_DIR/.fastcache/tmp.<pid>.<rand>/ as soon as
+// its writer has written and hashed it (note()), by a small pool of syscall-only
+// threads (copy_file_range; pread/pwrite through .bss buffers). They never touch the
+// heap and never return, so they keep working through zap_and_exit's teardown. After
+// the last output file, seal() renders OK (fp, sizes, content hashes) once the noted set
+// is exactly the parquet set in OUTPUT_DIR; whoever sees "sealed and every copy done"
+// first writes OK (O_EXCL) and renames tmp -> <fp>. main waits for that up to a cap
+// scaled by the bytes still to copy; unfinished = unpublished (next run removes it).
 
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::SeqCst};
 const MAXF: usize = 64;
 const PATHB: usize = 1024;
-const STORE_THREADS: usize = 4;
+const POOL: usize = 4;
 const SBUF: usize = 1 << 20;
+
+struct Job {
+    src: i32,
+    dst: i32,
+    size: u64,
+}
 struct Plan {
-    n: usize,
-    src: [i32; MAXF],
-    dst: [i32; MAXF],
-    size: [u64; MAXF],
+    jobs: [Job; MAXF],
     ok_path: [u8; PATHB],
     tmp_dir: [u8; PATHB],
     fin_dir: [u8; PATHB],
-    /// the complete OK file, rendered before the store threads start
     ok: [u8; 8192],
     ok_len: usize,
 }
 static mut PLAN: Plan = Plan {
-    n: 0,
-    src: [-1; MAXF],
-    dst: [-1; MAXF],
-    size: [0; MAXF],
+    jobs: [const { Job { src: -1, dst: -1, size: 0 } }; MAXF],
     ok_path: [0; PATHB],
     tmp_dir: [0; PATHB],
     fin_dir: [0; PATHB],
     ok: [0; 8192],
     ok_len: 0,
 };
-/// per store thread copy buffers (.bss: never zapped, no heap)
-static mut SBUFS: [[u8; SBUF]; STORE_THREADS] = [[0; SBUF]; STORE_THREADS];
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::SeqCst};
+static mut SBUFS: [[u8; SBUF]; POOL] = [[0; SBUF]; POOL];
+/// jobs [0, PUB) are filled; NEXT = next job to take; DONE = jobs finished
+static PUB: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
+static BYTES_PUB: AtomicUsize = AtomicUsize::new(0);
+static BYTES_DONE: AtomicUsize = AtomicUsize::new(0);
 static FAIL: AtomicBool = AtomicBool::new(false);
-/// 0 = no plan, 1 = planned, 2 = published, 3 = failed
-static STATE: AtomicU8 = AtomicU8::new(0);
+/// 0 = open (jobs may still come), 1 = sealed (OK rendered, n = PUB), 2 = publishing,
+/// 3 = published, 4 = failed / off
+static STATE: AtomicU8 = AtomicU8::new(4);
+static ENABLED: AtomicBool = AtomicBool::new(false);
+/// pool thread stack / TLS addresses (kept out of the zap)
+static KEEP: [AtomicUsize; 2 * POOL] = [const { AtomicUsize::new(0) }; 2 * POOL];
+
+struct Open {
+    tmp: PathBuf,
+    noted: Vec<(String, u64, [u8; 32])>,
+    spawned: bool,
+}
+static OPEN: Mutex<Option<Open>> = Mutex::new(None);
+
+/// Arms the store for this run (miss path, cache not disabled). Cheap; no I/O.
+pub fn enable_notes() {
+    ENABLED.store(true, SeqCst);
+    STATE.store(0, SeqCst);
+}
 
 fn cpath(dst: &mut [u8; PATHB], p: &Path) -> Option<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -579,102 +582,106 @@ fn cpath(dst: &mut [u8; PATHB], p: &Path) -> Option<()> {
     Some(())
 }
 
-/// Address inside the plan (for the zap keep list).
-pub fn plan_addr() -> usize {
-    std::ptr::addr_of!(PLAN) as usize
+fn fail(why: &str) {
+    FAIL.store(true, SeqCst);
+    let _ = STATE.compare_exchange(0, 4, SeqCst, SeqCst);
+    log(&format!("store skip: {why}"));
 }
 
-/// Prepares the store of the outputs in `out` under fingerprint `fp`: removes every
-/// other entry, creates <fp>.tmp.<pid>/ with the destination files, opens the sources.
-/// Call after every output file is written and closed, before any store thread runs.
-pub fn plan_store(fp: &str, out: &Path) -> bool {
+/// Creates the tmp entry dir (first call): never creates SCRATCH_DIR itself; removes every
+/// other entry first so scratch cannot grow.
+fn open_tmp() -> Option<PathBuf> {
+    let sd = scratch_dir();
+    if !std::fs::metadata(&sd).ok()?.is_dir() {
+        return None;
+    }
+    let base = sd.join(DIR);
+    if std::fs::create_dir(&base).is_err() && !std::fs::symlink_metadata(&base).ok()?.file_type().is_dir() {
+        return None;
+    }
+    for e in std::fs::read_dir(&base).ok()?.flatten() {
+        let p = e.path();
+        let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+    }
+    // unique per run even across containers (the entrypoint is often pid 1 everywhere)
+    let mut rnd = [0u8; 8];
+    let got = unsafe { libc::getrandom(rnd.as_mut_ptr() as *mut libc::c_void, 8, libc::GRND_NONBLOCK) };
+    let tag = u64::from_le_bytes(rnd) ^ mono_ns().rotate_left(32) ^ if got == 8 { 0 } else { std::process::id() as u64 };
+    let tmp = base.join(format!("tmp.{}.{tag:016x}", std::process::id()));
+    std::fs::create_dir(&tmp).ok()?;
+    std::fs::create_dir(tmp.join("user_daily")).ok()?;
+    std::fs::create_dir(tmp.join("campaign_daily")).ok()?;
+    Some(tmp)
+}
+
+/// Output file `rel` = `bytes` was just written to OUTPUT_DIR/`out_path`: hash it and
+/// queue its copy into the cache. Never fails the run.
+pub fn note(rel: &str, bytes: &[u8], out_path: &Path) {
+    if !ENABLED.load(SeqCst) || STATE.load(SeqCst) != 0 {
+        return;
+    }
+    let mut h = FH::new();
+    h.update(bytes);
+    let hx = h.hex();
+    let mut g = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if STATE.load(SeqCst) != 0 {
+        return;
+    }
+    if g.is_none() {
+        match open_tmp() {
+            Some(tmp) => *g = Some(Open { tmp, noted: Vec::new(), spawned: false }),
+            None => return fail("scratch not usable"),
+        }
+    }
+    let o = g.as_mut().unwrap();
+    let i = PUB.load(SeqCst);
+    if i >= MAXF || !valid_rel(rel) || o.noted.iter().any(|(r, _, _)| r == rel) {
+        return fail("unexpected output file");
+    }
     use std::os::unix::io::IntoRawFd;
-    let r = (|| {
-        let sd = scratch_dir();
-        if !std::fs::metadata(&sd).ok()?.is_dir() {
-            return None; // never create SCRATCH_DIR itself
-        }
-        let base = sd.join(DIR);
-        if std::fs::create_dir(&base).is_err() && !std::fs::symlink_metadata(&base).ok()?.file_type().is_dir() {
-            return None;
-        }
-        for e in std::fs::read_dir(&base).ok()?.flatten() {
-            let p = e.path();
-            let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
-        }
-        let v = listing(out)?;
-        if v.is_empty() || v.len() > MAXF {
-            return None;
-        }
-        // every output file must have been hashed from the bytes written to it
-        let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        noted.sort();
-        if noted.len() != v.len() || noted.iter().zip(&v).any(|(a, b)| a.0 != b.0 || a.1 != b.1) {
-            return None;
-        }
-        let mut okv = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
-        for (rel, sz, hx) in &noted {
-            okv.push_str(&format!("{sz}\t{}\t{rel}\n", std::str::from_utf8(hx).ok()?));
-        }
-        okv.push_str("end\n");
-        parse_ok(&okv, fp)?; // never publish what replay would reject
-        // unique per run even across containers (the entrypoint is often pid 1 everywhere)
-        let mut rnd = [0u8; 8];
-        let got = unsafe { libc::getrandom(rnd.as_mut_ptr() as *mut libc::c_void, 8, libc::GRND_NONBLOCK) };
-        let tag = u64::from_le_bytes(rnd) ^ mono_ns().rotate_left(32) ^ if got == 8 { 0 } else { std::process::id() as u64 };
-        let tmp = base.join(format!("{fp}.tmp.{}.{tag:016x}", std::process::id()));
-        std::fs::create_dir(&tmp).ok()?;
-        std::fs::create_dir(tmp.join("user_daily")).ok()?;
-        std::fs::create_dir(tmp.join("campaign_daily")).ok()?;
-        // SAFETY: single-threaded here (no store thread exists yet)
-        let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
-        if okv.len() > plan.ok.len() {
-            return None;
-        }
-        for (i, (rel, sz)) in v.iter().enumerate() {
-            let src = File::open(out.join(rel)).ok()?;
-            if src.metadata().ok()?.len() != *sz {
-                return None;
+    let (Ok(src), Ok(dst)) = (File::open(out_path), std::fs::OpenOptions::new().write(true).create_new(true).open(o.tmp.join(rel))) else {
+        return fail("open");
+    };
+    if src.metadata().map(|m| m.len()).ok() != Some(bytes.len() as u64) {
+        return fail("output size changed");
+    }
+    // SAFETY: job i is not visible to the pool until PUB moves past it (SeqCst)
+    unsafe {
+        let j = &mut (*std::ptr::addr_of_mut!(PLAN)).jobs[i];
+        j.src = src.into_raw_fd();
+        j.dst = dst.into_raw_fd();
+        j.size = bytes.len() as u64;
+    }
+    o.noted.push((rel.to_string(), bytes.len() as u64, hx));
+    BYTES_PUB.fetch_add(bytes.len(), SeqCst);
+    PUB.store(i + 1, SeqCst);
+    if !o.spawned {
+        o.spawned = true;
+        for t in 0..POOL {
+            if std::thread::Builder::new().name("cache".into()).spawn(move || pool(t)).is_err() {
+                return fail("spawn");
             }
-            let dst = std::fs::OpenOptions::new().write(true).create_new(true).open(tmp.join(rel)).ok()?;
-            plan.src[i] = src.into_raw_fd();
-            plan.dst[i] = dst.into_raw_fd();
-            plan.size[i] = *sz;
-            plan.n = i + 1;
         }
-        cpath(&mut plan.ok_path, &tmp.join("OK"))?;
-        cpath(&mut plan.tmp_dir, &tmp)?;
-        cpath(&mut plan.fin_dir, &base.join(fp))?;
-        plan.ok[..okv.len()].copy_from_slice(okv.as_bytes());
-        plan.ok_len = okv.len();
-        Some(())
-    })();
-    if r.is_some() {
-        STATE.store(1, SeqCst);
-        true
-    } else {
-        log("store disabled: scratch not usable");
-        false
     }
 }
 
-/// Copies planned file i (copy_file_range; pread/pwrite through `buf` if the kernel
-/// refuses). true = exactly `size` bytes copied and neither file has another length.
-fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF]) -> bool {
-    let (src, dst, size) = (plan.src[i], plan.dst[i], plan.size[i]);
+/// Copies job i through `buf`. true = exactly `size` bytes and neither file has another length.
+fn copy_job(j: &Job, buf: &mut [u8; SBUF]) -> bool {
+    let (src, dst, size) = (j.src, j.dst, j.size);
     let mut done: u64 = 0;
     let mut kernel = true;
     while done < size {
         if FAIL.load(SeqCst) {
             return false;
         }
-        let want = ((size - done) as usize).min(1 << 30);
+        let want = ((size - done) as usize).min(64 << 20);
         if kernel {
             let mut oi = done as i64;
             let mut oo = done as i64;
             let r = unsafe { libc::copy_file_range(src, &mut oi, dst, &mut oo, want, 0) };
             if r > 0 {
                 done += r as u64;
+                BYTES_DONE.fetch_add(r as usize, SeqCst);
                 continue;
             }
             kernel = false; // EXDEV / ENOSYS / EINVAL / 0: copy by hand from here
@@ -694,6 +701,7 @@ fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF]) -> bool {
             w += x as usize;
         }
         done += r as u64;
+        BYTES_DONE.fetch_add(r, SeqCst);
     }
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let mut ss: libc::stat = unsafe { std::mem::zeroed() };
@@ -703,64 +711,140 @@ fn store_one(plan: &Plan, i: usize, buf: &mut [u8; SBUF]) -> bool {
     st.st_size as u64 == size && ss.st_size as u64 == size
 }
 
-/// Store worker `t` (< STORE_THREADS): syscalls only (no heap, no stdio), safe to run
-/// during the zap. The thread finishing the last file renders OK and publishes.
-pub fn store_work(t: usize) {
-    if STATE.load(SeqCst) != 1 || t >= STORE_THREADS {
+/// Writes OK and renames tmp -> fp, once: syscalls only.
+fn try_publish() {
+    if STATE.compare_exchange(1, 2, SeqCst, SeqCst).is_err() {
         return;
     }
-    // SAFETY: the plan is immutable once STATE == 1
+    // SAFETY: the plan's paths and OK are immutable once sealed
     let plan = unsafe { &*std::ptr::addr_of!(PLAN) };
+    let ok = !FAIL.load(SeqCst) && unsafe {
+        let fd = libc::open(plan.ok_path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o644);
+        fd >= 0 && {
+            let w = libc::write(fd, plan.ok.as_ptr() as *const libc::c_void, plan.ok_len);
+            libc::close(fd) == 0 && w == plan.ok_len as isize
+        } && libc::rename(plan.tmp_dir.as_ptr() as *const libc::c_char, plan.fin_dir.as_ptr() as *const libc::c_char) == 0
+    };
+    STATE.store(if ok { 3 } else { 4 }, SeqCst);
+}
+
+/// Pool thread: syscalls only, no heap, never returns (thread exit would free heap).
+fn pool(t: usize) {
+    let probe = 0u8;
+    KEEP[2 * t].store(std::hint::black_box(&probe) as *const u8 as usize, SeqCst);
+    KEEP[2 * t + 1].store(tls_probe(), SeqCst);
+    // SAFETY: each pool thread owns SBUFS[t]; jobs below PUB are immutable
     let buf = unsafe { &mut (*std::ptr::addr_of_mut!(SBUFS))[t] };
     loop {
-        let i = NEXT.fetch_add(1, SeqCst);
-        if i >= plan.n {
-            return;
+        let i = NEXT.load(SeqCst);
+        if i < PUB.load(SeqCst) {
+            if NEXT.compare_exchange(i, i + 1, SeqCst, SeqCst).is_err() {
+                continue;
+            }
+            let j = unsafe { &(*std::ptr::addr_of!(PLAN)).jobs[i] };
+            if !copy_job(j, buf) {
+                FAIL.store(true, SeqCst);
+            }
+            unsafe {
+                libc::close(j.src);
+                libc::close(j.dst);
+            }
+            DONE.fetch_add(1, SeqCst);
+            continue;
         }
-        if !store_one(plan, i, buf) {
-            FAIL.store(true, SeqCst);
-        }
-        unsafe {
-            libc::close(plan.src[i]);
-            libc::close(plan.dst[i]);
-        }
-        if DONE.fetch_add(1, SeqCst) + 1 == plan.n {
-            let ok = !FAIL.load(SeqCst);
-            let ok = ok && unsafe {
-                let fd = libc::open(plan.ok_path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o644);
-                fd >= 0 && {
-                    let w = libc::write(fd, plan.ok.as_ptr() as *const libc::c_void, plan.ok_len);
-                    libc::close(fd) == 0 && w == plan.ok_len as isize
-                } && libc::rename(plan.tmp_dir.as_ptr() as *const libc::c_char, plan.fin_dir.as_ptr() as *const libc::c_char) == 0
-            };
-            STATE.store(if ok { 2 } else { 3 }, SeqCst);
-            return;
+        match STATE.load(SeqCst) {
+            1 if DONE.load(SeqCst) == PUB.load(SeqCst) => try_publish(),
+            0 | 1 => {
+                let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
+                unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            }
+            _ => unsafe {
+                libc::pause();
+            },
         }
     }
 }
 
-/// Store threads worth spawning (0 = nothing planned).
-pub fn store_threads() -> usize {
-    if STATE.load(SeqCst) == 1 {
-        unsafe { (*std::ptr::addr_of!(PLAN)).n }.min(STORE_THREADS)
-    } else {
-        0
-    }
+thread_local! {
+    static TLS: u8 = const { 0 };
+}
+fn tls_probe() -> usize {
+    TLS.with(|x| x as *const u8 as usize)
 }
 
-/// Spins (sched_yield, no heap) until the store finished or `deadline_ns`
+/// Addresses the zap must not touch: the plan, the copy buffers, pool stacks and TLS.
+pub fn keep_addrs() -> Vec<usize> {
+    let mut v = vec![std::ptr::addr_of!(PLAN) as usize, std::ptr::addr_of!(SBUFS) as usize];
+    v.extend(KEEP.iter().map(|a| a.load(SeqCst)).filter(|&a| a != 0));
+    v
+}
+
+/// After the last output file: checks the noted set == exactly the parquet files in
+/// `out` (names + sizes), renders OK for `fp` and seals. true = a publish is pending.
+pub fn seal(fp: Option<&str>, out: &Path) -> bool {
+    let g = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if STATE.load(SeqCst) != 0 {
+        return false;
+    }
+    let (Some(fp), Some(o)) = (fp, g.as_ref()) else {
+        fail("no fingerprint or nothing written");
+        return false;
+    };
+    let r = (|| {
+        let v = listing(out)?;
+        let mut noted = o.noted.clone();
+        noted.sort();
+        if noted.len() != v.len() || noted.iter().zip(&v).any(|(a, b)| a.0 != b.0 || a.1 != b.1) {
+            return None;
+        }
+        let mut okv = format!("{VERSION}\nfp {fp}\nn {}\n", v.len());
+        for (rel, sz, hx) in &noted {
+            okv.push_str(&format!("{sz}\t{}\t{rel}\n", std::str::from_utf8(hx).ok()?));
+        }
+        okv.push_str("end\n");
+        parse_ok(&okv, fp)?; // never publish what replay would reject
+        // SAFETY: the pool reads these only after STATE == 1 (SeqCst below)
+        let plan = unsafe { &mut *std::ptr::addr_of_mut!(PLAN) };
+        if okv.len() > plan.ok.len() {
+            return None;
+        }
+        cpath(&mut plan.ok_path, &o.tmp.join("OK"))?;
+        cpath(&mut plan.tmp_dir, &o.tmp)?;
+        cpath(&mut plan.fin_dir, &o.tmp.parent()?.join(fp))?;
+        plan.ok[..okv.len()].copy_from_slice(okv.as_bytes());
+        plan.ok_len = okv.len();
+        Some(())
+    })();
+    if r.is_none() {
+        fail("output set differs from the noted set");
+        return false;
+    }
+    STATE.store(1, SeqCst);
+    if DONE.load(SeqCst) == PUB.load(SeqCst) {
+        try_publish();
+    }
+    true
+}
+
+/// Bytes still to copy.
+pub fn pending_bytes() -> usize {
+    BYTES_PUB.load(SeqCst).saturating_sub(BYTES_DONE.load(SeqCst))
+}
+
+/// Spins (nanosleep, no heap) until the store is published / failed or `deadline_ns`
 /// (CLOCK_MONOTONIC) passes. true = published.
 pub fn store_wait(deadline_ns: u64) -> bool {
     loop {
         match STATE.load(SeqCst) {
-            0 | 3 => return false,
-            2 => return true,
+            3 => return true,
+            0 | 4 => return false,
             _ => {}
         }
         if mono_ns() >= deadline_ns {
             return false;
         }
-        unsafe { libc::sched_yield() };
+        let ts = libc::timespec { tv_sec: 0, tv_nsec: 50_000 };
+        unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
     }
 }
 
@@ -770,12 +854,13 @@ pub fn mono_ns() -> u64 {
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
 }
 
-/// The store for runs without the zap: plan + copy synchronously.
-pub fn store_sync(fp: &str, out: &Path) {
-    if plan_store(fp, out) {
-        store_work(0);
-        log(if STATE.load(SeqCst) == 2 { "stored" } else { "store failed" });
+/// How long main may wait for the store at exit: FAST_CACHE_GRACE_US if set, else
+/// 5 ms + the pending bytes at 1 GB/s, capped at 400 ms.
+pub fn grace_ns() -> u64 {
+    if let Some(us) = std::env::var("FAST_CACHE_GRACE_US").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        return us * 1000;
     }
+    (5_000_000 + pending_bytes() as u64).min(400_000_000)
 }
 
 #[cfg(test)]
