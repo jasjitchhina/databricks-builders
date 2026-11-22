@@ -102,7 +102,8 @@ check() {  # check NAME DATA ANSWER — run 1 on a fresh scratch (miss), run 2 o
         echo "FAIL $name@replay: scratch holds a cache entry but FAST_VERBOSE run 2 logged no 'cache:' line"; FAILS+=("$name@replay")
       else
         echo "ok   $name@replay ($(awk "BEGIN{printf \"%.1f\", $t2-$t1}")s untimed; ${c2:-no cache}$([ "${c2#cache: hit}" != "$c2" ] && echo '; byte-identical'))"
-        case "$c2" in "cache: hit"*) REPLAY_HITS=$((REPLAY_HITS+1));; esac
+        case "$c2" in "cache: hit"*) REPLAY_HITS=$((REPLAY_HITS+1));;
+          "cache: miss"*) echo "warn $name@replay: cache-enabled target did not hit (perf only: run 1 published no entry? $(ls "$scr/.fastcache" 2>/dev/null | wc -l) entries)";; esac
       fi
     fi
   fi
