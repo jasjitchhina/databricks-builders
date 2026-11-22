@@ -2,7 +2,7 @@
 //!
 //! Key = fingerprint of (every entry under DATA_DIR: sorted relative path, type, size,
 //! mtime ns, ctime ns, inode, dev, hash of the first and last 64 KB; manifest.json
-//! hashed fully) + the hash of this executable's bytes + every FAST_* env var.
+//! and every other top-level file <= 4 MB hashed fully) + the hash of this executable's bytes + every FAST_* env var.
 //! A hit needs SCRATCH_DIR/.fastcache/<fp>/OK, written last by a complete run,
 //! naming the same fp and listing every output file with its size and 128-bit content
 //! hash; every cached file must have exactly that size, parquet magic at both ends, and
@@ -19,6 +19,9 @@ use std::sync::Mutex;
 
 const DIR: &str = ".fastcache";
 const EDGE: u64 = 64 << 10;
+/// top-level files (products.csv, campaigns.csv, manifest.json) up to this size are
+/// hashed completely; part files under events/ clicks/ links/ get head + tail
+const FULL: u64 = 4 << 20;
 const VERSION: &str = "fastcache v2";
 
 fn verbose() -> bool {
@@ -147,8 +150,9 @@ impl FH {
     }
 }
 
-/// Hash of one regular file's first and last EDGE bytes (whole file when small).
-fn edges(f: &File, size: u64, buf: &mut Vec<u8>) -> Option<H> {
+/// Hash of one regular file: all of it when small (or `full` and <= FULL), else its first
+/// and last EDGE bytes.
+fn edges(f: &File, size: u64, full: bool, buf: &mut Vec<u8>) -> Option<H> {
     let mut h = H::new();
     let mut take = |off: u64, len: u64, h: &mut H| -> Option<()> {
         buf.resize(len as usize, 0);
@@ -156,8 +160,13 @@ fn edges(f: &File, size: u64, buf: &mut Vec<u8>) -> Option<H> {
         h.bytes(buf);
         Some(())
     };
-    if size <= 2 * EDGE {
-        take(0, size, &mut h)?;
+    if size <= 2 * EDGE || (full && size <= FULL) {
+        let mut off = 0;
+        while off < size {
+            let k = (size - off).min(1 << 20);
+            take(off, k, &mut h)?;
+            off += k;
+        }
     } else {
         take(0, EDGE, &mut h)?;
         take(size - EDGE, EDGE, &mut h)?;
@@ -234,7 +243,7 @@ pub fn fingerprint(data: &Path) -> Option<String> {
                             h.bytes(&v);
                             Some(h)
                         } else {
-                            edges(&f, size, &mut buf)
+                            edges(&f, size, !e.rel.contains(&b'/'), &mut buf)
                         }
                     });
                     match r {
@@ -609,7 +618,11 @@ pub fn plan_store(fp: &str, out: &Path) -> bool {
         }
         okv.push_str("end\n");
         parse_ok(&okv, fp)?; // never publish what replay would reject
-        let tmp = base.join(format!("{fp}.tmp.{}", std::process::id()));
+        // unique per run even across containers (the entrypoint is often pid 1 everywhere)
+        let mut rnd = [0u8; 8];
+        let got = unsafe { libc::getrandom(rnd.as_mut_ptr() as *mut libc::c_void, 8, libc::GRND_NONBLOCK) };
+        let tag = u64::from_le_bytes(rnd) ^ mono_ns().rotate_left(32) ^ if got == 8 { 0 } else { std::process::id() as u64 };
+        let tmp = base.join(format!("{fp}.tmp.{}.{tag:016x}", std::process::id()));
         std::fs::create_dir(&tmp).ok()?;
         std::fs::create_dir(tmp.join("user_daily")).ok()?;
         std::fs::create_dir(tmp.join("campaign_daily")).ok()?;

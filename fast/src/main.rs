@@ -33,7 +33,7 @@ fn main() {
     }
     if fast::cache::disabled() {
         if cache_log {
-            eprintln!("[cache] off: disabled");
+            eprintln!("[cache] miss: disabled");
         }
     } else if fast::cache::any_entry() {
         fp_now = fast::cache::fingerprint(&data);
