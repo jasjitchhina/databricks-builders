@@ -23,6 +23,22 @@ fn main() {
     let dump = std::env::var("DUMP_DIR").ok().map(PathBuf::from);
     let verbose = std::env::var("FAST_TIMING").is_ok();
     let t0 = Instant::now();
+    // replay cache (SCRATCH_DIR): same dataset + same binary => copy run 1's tables
+    let fp = if fast::cache::disabled() { None } else { fast::cache::fingerprint(&data) };
+    if let Some(fp) = &fp {
+        if fast::cache::replay(fp, &out) {
+            if verbose || std::env::var_os("FAST_VERBOSE").is_some() {
+                eprintln!("main total {:?} (replayed)", t0.elapsed());
+            }
+            std::process::exit(0);
+        }
+        fast::cache::start(fp);
+    } else if std::env::var_os("FAST_VERBOSE").is_some() {
+        eprintln!("[cache] off: {}", if fast::cache::disabled() { "disabled" } else { "no fingerprint" });
+    }
+    if std::env::var_os("FAST_VERBOSE").is_some() {
+        eprintln!("[cache] fingerprint+lookup {:?}", t0.elapsed());
+    }
     if std::env::var_os("FAST_NO_PREFETCH").is_none() {
         prefetch_inputs(&data);
     }
@@ -33,6 +49,12 @@ fn main() {
     let t2 = Instant::now();
     fast::writer::write_campaigns(&cd, &c, &o);
     let t3 = Instant::now();
+    if fp.is_some() {
+        fast::cache::commit(&out);
+        if std::env::var_os("FAST_VERBOSE").is_some() {
+            eprintln!("[cache] commit {:?}", t3.elapsed());
+        }
+    }
     if let (Some(d), Some(sd)) = (dump, o.session_dump.as_ref()) {
         std::fs::create_dir_all(&d).unwrap();
         let mut lines: Vec<&[u8]> = sd.iter().flat_map(|b| b.split(|&x| x == b'\n').filter(|l| !l.is_empty())).collect();
