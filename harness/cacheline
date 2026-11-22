@@ -1,0 +1,5 @@
+#!/bin/sh
+# cacheline LOGFILE: the target's first replay-cache verdict line, normalized to "cache: hit ..." / "cache: miss ...".
+# Accepts "cache: hit|miss ..." and fast's FAST_VERBOSE form "[cache] hit <fp>: ..." / "[cache] miss: <why>".
+# FAST_NO_CACHE / DUMP_DIR runs may log nothing (-> empty output).
+grep -aE '^(cache: |\[cache\] )(hit|miss)' "$1" 2>/dev/null | head -1 | sed -E 's/^\[cache\] /cache: /; s/^cache: (hit|miss):? */cache: \1 /; s/ +$//'
